@@ -1,8 +1,9 @@
+
 import json
 import os
 
 from sqlalchemy import create_engine
-from sqlalchemy.orm import as_declarative
+from sqlalchemy.orm import sessionmaker, declarative_base
 
 path_to_config = os.environ.get("PATH_TO_CONFIG", "config.json")
 
@@ -14,11 +15,18 @@ db_host = config["database"]["host"]
 db_password = config["database"]["password"]
 db_database = config["database"]["name"]
 
-engine = create_engine(f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}/{db_database}")
+DATABASE_URL = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}/{db_database}"
 
+# Защита от "мертвых" соединений и периодическая переработка пула
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=300,
+    connect_args={}  # при необходимости добавьте sslmode или другие параметры
+)
 
+# Session factory
+Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-@as_declarative()
-class AbstractModel: pass
-
-
+# Базовый класс для моделей
+Base = declarative_base()
