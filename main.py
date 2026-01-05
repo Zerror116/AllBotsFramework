@@ -3689,32 +3689,47 @@ def manage_audit_posts(message):
 def show_posts_by_date(message):
     global active_audit
 
-    selected_date = message.text
+    selected_date_text = message.text  # например "21 октября"
 
-    # Пробуем преобразовать дату пользователя в формат YYYY-MM-DD
-    try:
-        current_year = datetime.now().year  # Текущий год
-        selected_date_with_year = f"{selected_date} {current_year}"  # Добавляем год
-        selected_date_parsed = datetime.strptime(selected_date_with_year, "%d %B %Y").date()
-        selected_date = str(selected_date_parsed)  # Преобразуем в строку формата YYYY-MM-DD
-    except ValueError:
-        bot.send_message(message.chat.id, "Неправильный формат даты. Пожалуйста, введите дату в формате '24 марта'.")
+    # Получаем все посты из БД и формируем уникальные даты (raw)
+    all_posts = Posts.get_row_all()
+    if not all_posts:
+        bot.send_message(message.chat.id, "Нет постов в базе.")
         return
+
+    unique_dates_raw = sorted(list({post.created_at.date() for post in all_posts}))
+
+    # Ищем в уникальных датах ту, которая соответствует выбранному формату "DD Month"
+    matched_date = None
+    for d in unique_dates_raw:
+        try:
+            if d.strftime("%d %B") == selected_date_text:
+                matched_date = d
+                break
+        except Exception:
+            # На случай проблем с локалью/форматом, пропускаем
+            continue
+
+    if not matched_date:
+        bot.send_message(message.chat.id, "Дата не найдена в базе. Пожалуйста, выберите другую дату.")
+        return
+
+    # Преобразуем найденную дату в строку формата YYYY-MM-DD для сравнения с created_at.date()
+    selected_date = str(matched_date)
 
     today_date = datetime.now().date()  # Сегодняшняя дата
 
-    # Получаем и сразу обрабатываем посты с quantity = 0
+    # Обрабатываем посты с quantity = 0: переносим их на сегодняшнюю дату и помечаем как отправленные
     zero_quantity_posts = [
-        post for post in Posts.get_row_all()
+        post for post in all_posts
         if post.quantity == 0 and str(post.created_at.date()) == selected_date
     ]
 
     for post in zero_quantity_posts:
-        post.created_at = datetime.combine(today_date, datetime.min.time())  # Устанавливаем сегодняшнюю дату
-        post.is_sent = True  # Отмечаем как отправленные
-        # Явно обновляем поля через ORM
+        post.created_at = datetime.combine(today_date, datetime.min.time())
+        post.is_sent = True
         Posts.update_row(
-            post.id,  # Обновляем по ID поста
+            post.id,
             created_at=post.created_at,
             is_sent=post.is_sent
         )
@@ -3748,10 +3763,8 @@ def show_posts_by_date(message):
 
         keyboard = types.InlineKeyboardMarkup()
         keyboard.add(types.InlineKeyboardButton(text="Изменить цену", callback_data=f"audit_edit_price_{post.id}"))
-        keyboard.add(
-            types.InlineKeyboardButton(text="Изменить описание", callback_data=f"audit_edit_description_{post.id}"))
-        keyboard.add(
-            types.InlineKeyboardButton(text="Изменить количество", callback_data=f"audit_edit_quantity_{post.id}"))
+        keyboard.add(types.InlineKeyboardButton(text="Изменить описание", callback_data=f"audit_edit_description_{post.id}"))
+        keyboard.add(types.InlineKeyboardButton(text="Изменить количество", callback_data=f"audit_edit_quantity_{post.id}"))
         keyboard.add(types.InlineKeyboardButton(text="Удалить", callback_data=f"audit_delete_post_{post.id}"))
         keyboard.add(types.InlineKeyboardButton(text="Подтвердить", callback_data=f"audit_confirm_post_{post.id}"))
 
