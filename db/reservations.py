@@ -71,7 +71,6 @@ class Reservations(AbstractModel):
         """
         Получить все бронирования. Если указан user_id — фильтровать по user_id.
         """
-        from db.db import Session, engine
         with Session(bind=engine) as session:
             query = session.query(Reservations)
             if user_id is not None:
