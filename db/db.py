@@ -20,5 +20,3 @@ engine = create_engine(f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}
 
 @as_declarative()
 class AbstractModel: pass
-
-
