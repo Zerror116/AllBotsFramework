@@ -1,8 +1,11 @@
 import io
 import re
-import time
 import telebot
+import threading
+import logging
 import locale
+import time
+
 
 from collections import defaultdict
 from openpyxl.workbook import Workbook
@@ -24,76 +27,165 @@ from handlers.reservations_manage import calculate_total_sum, calculate_processe
 from handlers.classess import *
 from sqlalchemy import select, update, and_, func
 from sqlalchemy.exc import IntegrityError
-from datetime import datetime
+from dataclasses import dataclass, field
+from typing import Dict, Any
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
+import logging
+
+
 
 
 # Настройка бота и кэш
 bot = telebot.TeleBot(TOKEN)
-user_messages = {}
-user_pages = {}
+
+# Константы
 PAGE_SIZE = 5
-user_last_message_id = {}
-last_bot_message = {}
-user_data = {}
-user_states = {}
-temp_user_data = {}
-temp_post_data = {}
-last_start_time = {}
+TEMP_DATA_TTL = 60 * 60  # 1 час, время жизни временных данных
+
+# Логгер
+logger = logging.getLogger("bot_cache")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [user:%(user_id)s] %(message)s"))
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
+
+# Потокобезопасные контейнеры и локи
+_global_lock = threading.RLock()
+
+user_messages: Dict[int, Any] = {}
+user_pages: Dict[int, Any] = {}
+user_last_message_id: Dict[int, int] = {}
+last_bot_message: Dict[int, Dict[str, int]] = {}
+user_data: Dict[int, Dict[str, Any]] = {}
+
+# Структуры для состояний и временных данных
+user_states: Dict[int, Any] = {}
+temp_user_data: Dict[int, Dict[str, Any]] = {}
+temp_post_data: Dict[int, Dict[str, Any]] = {}
+last_start_time: Dict[int, float] = {}
 delivery_active = False
-locale.setlocale(locale.LC_TIME, "ru_RU")
-active_audit = {}
+active_audit: Dict[int, Any] = {}
+
+@dataclass
+class TempData:
+    payload: dict = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+
+# Helper: безопасные операции
+def set_temp_data(user_id: int, payload: dict):
+    with _global_lock:
+        temp_user_data[user_id] = TempData(payload=payload)
+        logger.debug("Set temp data", extra={"user_id": user_id})
+
+def get_temp_data(user_id: int):
+    with _global_lock:
+        td = temp_user_data.get(user_id)
+        return td.payload if td else {}
+
+def pop_temp_data(user_id: int):
+    with _global_lock:
+        return temp_user_data.pop(user_id, None)
+
+def set_user_state(user_id: int, state):
+    with _global_lock:
+        user_states[user_id] = state
+
+def get_user_state(user_id: int):
+    with _global_lock:
+        return user_states.get(user_id)
+
+def clear_user_state(user_id: int):
+    with _global_lock:
+        user_states.pop(user_id, None)
+
+# Очистка устаревших temp данных (можно запускать периодически в отдельном потоке/таймере)
+def cleanup_temp_data(ttl: int = TEMP_DATA_TTL):
+    now = time.time()
+    removed = []
+    with _global_lock:
+        for uid, td in list(temp_user_data.items()):
+            created = td.created_at if isinstance(td, TempData) else td.get("created_at", now)
+            if now - created > ttl:
+                temp_user_data.pop(uid, None)
+                removed.append(uid)
+    if removed:
+        logger.info(f"Cleaned up temp data for users: {removed}")
+
+# Безопасный вызов locale
+try:
+    locale.setlocale(locale.LC_TIME, "ru_RU")
+except Exception as e:
+    logger.warning("Locale ru_RU not available, using default locale", extra={"user_id": None})
 
 
+# Глобальная структура last_bot_message должна быть объявлена ранее; если нет — создаём
+try:
+    last_bot_message
+except NameError:
+    last_bot_message = {}
 
-# Сохранение бронирования
-def save_reservation(user_id, post_id, quantity=1, is_fulfilled=False):
-    try:
-        Reservations.insert(
-            user_id=user_id,
-            quantity=quantity,
-            post_id=post_id,
-            is_fulfilled=is_fulfilled,
-        )
-        return True, "Резервация успешно сохранена"
-    except Exception:
-        return False
+_last_bot_lock = threading.RLock()
 
-# Получение неотправленных постов
-@bot.message_handler(commands=["unsent_posts"])
-def list_unsent_posts(message):
-    user_id = message.chat.id
-    role = get_client_role(user_id)
+def set_last_bot_message_safe(user_id: int, key: str, message_id):
+    with _last_bot_lock:
+        if user_id not in last_bot_message:
+            last_bot_message[user_id] = {}
+        last_bot_message[user_id][key] = message_id
 
-    # Проверяем роль пользователя
-    if role not in ["admin", "worker", "supreme_leader", "audit"]:
-        bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
+def get_last_bot_message_safe(user_id: int):
+    with _last_bot_lock:
+        data = last_bot_message.get(user_id)
+        return dict(data) if data else {}
+
+def safe_delete_message(chat_id, message_id):
+    if not message_id:
         return
-
-    # Получаем неотправленные посты через метод класса
     try:
-        unsent_posts = Posts.get_unsent_posts()
-    except Exception:
-        return
+        bot.delete_message(chat_id=chat_id, message_id=int(message_id))
+    except Exception as e:
+        try:
+            logger.debug(f"safe_delete_message failed: {e}", extra={"user_id": chat_id, "message_id": message_id})
+        except Exception:
+            pass
 
-    # Формируем и отправляем ответ
-    if unsent_posts:
-        response = "📮 Неотправленные посты:\n"
-        for post in unsent_posts:
-            post_id, price, description, quantity = post
-            response += f"ID: {post_id} | Цена: {price} ₽ | Описание: {description} | Количество: {quantity}\n"
-        bot.send_message(user_id, response)
+def schedule_delete(chat_id, message_id, delay_seconds=5.0):
+    try:
+        t = threading.Timer(delay_seconds, lambda: safe_delete_message(chat_id, message_id))
+        t.daemon = True
+        t.start()
+    except Exception:
+        try:
+            logger.exception("Failed to schedule message deletion", extra={"user_id": chat_id})
+        except Exception:
+            pass
+
+def make_resources_inline():
+    kb = InlineKeyboardMarkup()
+    if 'support_link' in globals() and support_link:
+        kb.add(InlineKeyboardButton("💬 В поддержку", url=support_link))
     else:
-        bot.send_message(user_id, "✅ Все посты отправлены.")
+        kb.add(InlineKeyboardButton("💬 В поддержку", callback_data="support_no_link"))
+    if 'channel_link' in globals() and channel_link:
+        kb.add(InlineKeyboardButton("🔔 На канал", url=channel_link))
+    else:
+        kb.add(InlineKeyboardButton("🔔 На канал", callback_data="channel_no_link"))
+    kb.add(InlineKeyboardButton("📜 Правила", callback_data="rules"))
+    return kb
 
-# Инициализация старта бота
+
+#Обработчик /start
 @bot.message_handler(commands=["start"])
 def handle_start(message):
     user_id = message.chat.id
 
-    # Получаем роль пользователя
-    role = get_client_role(user_id)
+    try:
+        role = get_client_role(user_id)
+    except Exception:
+        logger.exception("Failed to get client role", extra={"user_id": user_id})
+        role = None
 
-    # Формируем персонализированное приветствие
     greetings = {
         "client": "Добро пожаловать в интерфейс бота, здесь вы можете просмотреть свою корзину или задать вопросы в чате поддержки.",
         "worker": "Давай за работу!",
@@ -103,442 +195,842 @@ def handle_start(message):
     }
     greeting = greetings.get(role, "Привет, прошу пройти регистрацию")
 
-    # Создаём инлайн-клавиатуру с кнопками
-    inline_markup = InlineKeyboardMarkup()
-    inline_markup.add(InlineKeyboardButton("В поддержку", url=support_link))
-    inline_markup.add(InlineKeyboardButton("На канал", url=channel_link))
-    inline_markup.add(InlineKeyboardButton("Правила", callback_data="rules"))  # Кнопка "Правила"
-
-    # Определяем reply-клавиатуру по роли пользователя
-    if role == "admin":
-        reply_markup = admin_main_menu()
-    elif role == "client":
-        reply_markup = client_main_menu()
-    elif role == "audit":
-        reply_markup = audit_main_menu()
-    elif role == "worker":
-        reply_markup = worker_main_menu()
-    elif role == "supreme_leader":
-        reply_markup = supreme_leader_main_menu()
-    else:
-        reply_markup = unknown_main_menu()
-
-    # Удаляем старые сообщения бота, если они существуют
-    if user_id in last_bot_message:
-        try:
-            # Удаляем сообщение с приветствием
-            bot.delete_message(
-                chat_id=user_id, message_id=last_bot_message[user_id]["greeting"]
-            )
-        except Exception as e:
-            print(
-                f"Не удалось удалить старое приветственное сообщение для {user_id}: {e}"
-            )
-        try:
-            # Удаляем сообщение с ресурсами
-            bot.delete_message(
-                chat_id=user_id, message_id=last_bot_message[user_id].get("resources")
-            )
-        except Exception:
-            pass
-
-    # Отправляем новое сообщение с приветствием
+    # Reply клавиатура по роли
     try:
-        sent_greeting = bot.send_message(user_id, greeting, reply_markup=reply_markup)
-
-        # Если роль клиента, отправляем сообщение с ресурсами
-        if role == "client":
-            sent_resources = bot.send_message(
-                user_id, "Посетите наши ресурсы:", reply_markup=inline_markup
-            )
+        if role == "admin":
+            reply_markup = admin_main_menu()
+        elif role == "client":
+            reply_markup = client_main_menu()
+        elif role == "audit":
+            reply_markup = audit_main_menu()
+        elif role == "worker":
+            reply_markup = worker_main_menu()
+        elif role == "supreme_leader":
+            reply_markup = supreme_leader_main_menu()
         else:
-            sent_resources = None
+            reply_markup = unknown_main_menu()
+    except Exception:
+        logger.exception("Failed to build reply markup", extra={"user_id": user_id})
+        reply_markup = None
 
-        # Сохраняем ID новых сообщений
-        last_bot_message[user_id] = {
-            "greeting": sent_greeting.message_id,
-            "resources": sent_resources.message_id if sent_resources else None,
-        }
-    except Exception as e:
-        print(f"Ошибка при отправке сообщения для {user_id}: {e}")
+    inline_markup = make_resources_inline()
 
-    # Удаляем сообщение пользователя (команда /start)
+    prev = get_last_bot_message_safe(user_id)
+
+    # Удаляем старые greeting, если он в другом сообщении (чтобы не дублировалось)
+    prev_greeting = prev.get("greeting")
+    if prev_greeting:
+        # Если prev_greeting уже равно None — ничего не делаем
+        # Если prev_greeting существует, но мы собираемся отправить/редактировать другое сообщение, удалим старое
+        # Здесь мы предпочитаем редактирование, но если редактирование невозможно — удаляем старое и отправляем новое
+        pass  # логика ниже при редактировании/отправке обновит запись
+
+    # Попытка редактировать существующее greeting (если есть)
+    try:
+        if prev and prev.get("greeting"):
+            # Нельзя передавать ReplyKeyboardMarkup в edit_message_text — проверим тип
+            existing_id = prev["greeting"]
+            try:
+                if isinstance(reply_markup, InlineKeyboardMarkup):
+                    bot.edit_message_text(chat_id=user_id, message_id=existing_id, text=greeting, reply_markup=reply_markup)
+                    set_last_bot_message_safe(user_id, "greeting", existing_id)
+                else:
+                    # редактируем текст без reply_markup
+                    bot.edit_message_text(chat_id=user_id, message_id=existing_id, text=greeting)
+                    # если есть reply_markup (ReplyKeyboardMarkup), отправим новое сообщение с клавиатурой и удалим старое
+                    if reply_markup:
+                        sent = bot.send_message(user_id, greeting, reply_markup=reply_markup)
+                        safe_delete_message(user_id, existing_id)
+                        set_last_bot_message_safe(user_id, "greeting", sent.message_id)
+                    else:
+                        set_last_bot_message_safe(user_id, "greeting", existing_id)
+            except Exception:
+                # если редактирование не удалось — отправим новое и удалим старое
+                try:
+                    sent = bot.send_message(user_id, greeting, reply_markup=reply_markup)
+                    safe_delete_message(user_id, existing_id)
+                    set_last_bot_message_safe(user_id, "greeting", sent.message_id)
+                except Exception:
+                    logger.exception("Failed to send fallback greeting", extra={"user_id": user_id})
+        else:
+            sent = bot.send_message(user_id, greeting, reply_markup=reply_markup)
+            set_last_bot_message_safe(user_id, "greeting", sent.message_id)
+    except Exception:
+        logger.exception("Failed to send or edit greeting message", extra={"user_id": user_id})
+
+    # Ресурсы для клиента — отдельное сообщение
+    try:
+        if role == "client":
+            prev_res = prev.get("resources")
+            if prev_res:
+                try:
+                    bot.edit_message_text(chat_id=user_id, message_id=prev_res, text="Посетите наши ресурсы:", reply_markup=inline_markup)
+                    set_last_bot_message_safe(user_id, "resources", prev_res)
+                except Exception:
+                    sent_res = bot.send_message(user_id, "Посетите наши ресурсы:", reply_markup=inline_markup)
+                    set_last_bot_message_safe(user_id, "resources", sent_res.message_id)
+                    if prev_res and prev_res != sent_res.message_id:
+                        safe_delete_message(user_id, prev_res)
+            else:
+                sent_res = bot.send_message(user_id, "Посетите наши ресурсы:", reply_markup=inline_markup)
+                set_last_bot_message_safe(user_id, "resources", sent_res.message_id)
+        else:
+            # удаляем resources, если он был
+            prev_res = prev.get("resources")
+            if prev_res:
+                safe_delete_message(user_id, prev_res)
+            set_last_bot_message_safe(user_id, "resources", None)
+    except Exception:
+        logger.exception("Failed to send or edit resources message", extra={"user_id": user_id})
+
+    # Попытка удалить команду /start от пользователя (не критично)
     try:
         bot.delete_message(chat_id=user_id, message_id=message.message_id)
     except Exception:
-        pass
-
+        logger.debug("Could not delete /start message", extra={"user_id": user_id})
 
 # Обработчик нажатия на кнопку "Правила"
-import threading
-
-
 @bot.callback_query_handler(func=lambda call: call.data == "rules")
 def show_rules(call):
-    # Указываем текст правил
-    rules_text = ("Правила Мега Скидок:\n1.В описании к посту всегда пишется дефект(если он имеется) и количество."
-                  "\n2.Купленный товар возврату и обмену не подлежат."
-                  "\n3.Одежда дешевле 1 500₽, не подошедшая по размеру возврату не подлежат."
-                  "\n4.Администратор не знает что находится в корзине(Смотрите  Мои заказы)"
-                  "\n5.Просьба доложить товар будет проигнорирована, товары обрабатываются в аблолютно случайном порядке"
-                  "\n6.Бронь уходит первому нажавшему, и держится в течении некоторого времени"
-                  "\n7.До обработки товара вы можете отказаться от товара, как только товар оказался у вас в корзине, отказаться уже нельзя, только полная расформировка"
-                  "\n8.Доставка бесплатная от 2 000₽"
-                  "\n9.Если не набралось данной суммы, можно осуществить платную доставку стоимостью в 350₽"
-                  "\n10.Электрические товары, приобретенные у нас, имеют гарантию 7 дней."
-                  "\n11.В случае, если товар пришел с дефектом, который не был указан, можете обратиться в поддержку."
-                  "\nВо время доставки:"
-                  "\n12.Курьер не может звонить заранее более чем за 5 минут в связи с загруженностью"
-                  "\n13.Товар проверяется исключительно после оплаты"
-                  "\n14.Курьер не знает что находится у вас в корзине(Смотрите  Заказы в доставке)")
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
 
-    # Создаём разметку с кнопкой "Назад"
+    # Отформатированный текст правил в HTML
+    rules_text = (
+        "<b>🛒 Информация о товаре в постах</b>\n"
+        "В каждом посте мы предоставляем всю необходимую информацию о товаре:\n"
+        "• <b>О товаре</b>:\n"
+        "  — Под фотографией всегда есть подробное описание, включая количество товара и возможные дефекты.\n"
+        "  — Важно: если товар имеет дефект, это будет обязательно указано.\n"
+        "• <b>Упаковка</b>:\n"
+        "  — Дефекты упаковки указываются только для скоропортящихся товаров и товаров личной гигиены.\n\n"
+
+        "<b>🛡 Гарантия и возврат</b>\n"
+        "• <b>Гарантия</b>:\n"
+        "  — На электротовары действует гарантия в течение 7 дней после покупки.\n"
+        "• <b>Возврат и обмен</b>:\n"
+        "  — Товары, купленные у нас, не подлежат возврату и обмену, за исключением одежды стоимостью более 1 500₽ (при неподходящем размере).\n"
+        "  — Внимание: одежда стоимостью до 1 500₽ возврату не подлежит. Рекомендуем внимательно изучать описание перед покупкой.\n\n"
+
+        "<b>📐 Важная информация о размерах</b>\n"
+        "Стоит обратить особое внимание на размер одежды и обуви. У большинства производителей своя размерная сетка, которая может «большемерить» или «маломерить».\n"
+        "В таких случаях мы указываем размер в сантиметрах, измеряя изделие. Если вы бронируете вещь, опираясь только на размер производителя и игнорируете наши замеры, в возврате будет отказано.\n\n"
+
+        "<b>📦 Бронирование и отмена</b>\n"
+        "• ✅ Бронь уходит первому человеку, нажавшему кнопку «Забронировать».\n"
+        "• 🔄 После бронирования вы можете отменить товар до момента обработки заказа.\n"
+        "❗️ Если после обработки товар оказался в вашей корзине, отказ от него уже невозможен — потребуется полная расформировка.\n\n"
+
+        "<b>💰 Условия доставки</b>\n"
+        "• Бесплатная доставка для заказов от 1 500₽.\n"
+        "• Для заказов меньше 1 500₽ стоимость доставки — 350₽.\n\n"
+
+        "<b>❗️ Если не приняли доставку</b>\n"
+        "Если вы не приняли доставку (не взяли трубку, проигнорировали звонки), заказ возвращается на склад.\n"
+        "• Следующая доставка для вас будет платной (+350₽ единоразово).\n"
+        "• Исключение: вы заранее предупредили администратора о невозможности принять доставку.\n\n"
+
+        "<b>🆘 Обратная связь</b>\n"
+        "Если вы обнаружили дефект, который не был указан в описании, свяжитесь с нашей поддержкой."
+    )
+
+    # Кнопки: Назад и опционально Связаться с поддержкой (если есть support_link)
     markup = InlineKeyboardMarkup()
-    back_button = InlineKeyboardButton("⬅️ Назад", callback_data="back_to_start")  # Callback для возврата
+    back_button = InlineKeyboardButton("⬅️ Назад", callback_data="back_to_start")
     markup.add(back_button)
 
     try:
-        # Редактируем текущее сообщение: добавляем текст и кнопку
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=rules_text,
-            reply_markup=markup  # Кнопка для возврата
-        )
-    except Exception as e:
-        print(f"Ошибка при изменении текста сообщения: {e}")
+        # Если есть глобальная ссылка на поддержку — добавим кнопку
+        if 'support_link' in globals() and support_link:
+            support_btn = InlineKeyboardButton("💬 Поддержка", url=support_link)
+            markup.add(support_btn)
+    except Exception:
+        # не критично, продолжаем без кнопки поддержки
+        logger.debug("support_link not available or invalid", extra={"user_id": chat_id})
 
+    try:
+        # Пытаемся отредактировать текущее сообщение
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=rules_text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        # Если редактирование не удалось — отправляем новое сообщение и сохраняем его id для очистки
+        try:
+            sent = bot.send_message(chat_id, rules_text, parse_mode="HTML", reply_markup=markup)
+            # Сохраняем id в temp_user_data для возможной последующей очистки
+            temp_user_data.setdefault(chat_id, {})
+            hist = temp_user_data[chat_id].setdefault("reg_history", [])
+            if sent and getattr(sent, "message_id", None):
+                hist.append(sent.message_id)
+        except Exception as e:
+            # Логируем ошибку, не ломаем обработчик
+            try:
+                logger.exception("Failed to show rules message", extra={"user_id": chat_id})
+            except Exception:
+                pass
 
+#Обработчик возврата в главное меню
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_start")
 def back_to_start(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    current_msg_id = call.message.message_id
+
     try:
-        # Удаляем текущее сообщение с правилами
-        bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+        role = get_client_role(user_id)
+    except Exception:
+        logger.exception("get_client_role failed in back_to_start", extra={"user_id": user_id})
+        role = None
 
-        # Отправляем уведомление о возврате
-        notification_message = bot.send_message(
-            chat_id=call.message.chat.id,
-            text="Вы вернулись в главное меню."
-        )
+    greetings = {
+        "client": "Добро пожаловать в интерфейс бота, здесь вы можете просмотреть свою корзину или задать вопросы в чате поддержки.",
+        "worker": "Давай за работу!",
+        "audit": "Давай за работу!",
+        "supreme_leader": "С возвращением, Повелитель!",
+        "admin": "С возвращением в меню администратора",
+    }
+    greeting = greetings.get(role, "Привет, прошу пройти регистрацию")
 
-        # Используем таймер для удаления уведомления через 5 секунд
-        threading.Timer(5.0, bot.delete_message, args=(call.message.chat.id, notification_message.message_id)).start()
+    try:
+        if role == "admin":
+            reply_markup = admin_main_menu()
+        elif role == "client":
+            reply_markup = client_main_menu()
+        elif role == "audit":
+            reply_markup = audit_main_menu()
+        elif role == "worker":
+            reply_markup = worker_main_menu()
+        elif role == "supreme_leader":
+            reply_markup = supreme_leader_main_menu()
+        else:
+            reply_markup = unknown_main_menu()
+    except Exception:
+        logger.exception("Failed to build reply markup in back_to_start", extra={"user_id": user_id})
+        reply_markup = None
 
-        # Отправляем приветственное сообщение, вызывая handle_start
-        handle_start(call.message)
+    inline_markup = make_resources_inline()
 
-    except Exception as e:
-        print(f"Ошибка при обработке возврата в главное меню: {e}")
+    prev = get_last_bot_message_safe(user_id) or {}
+    prev_greeting_id = prev.get("greeting")
+    prev_resources_id = prev.get("resources")
+
+    # Удаляем старое greeting, если оно в другом сообщении
+    if prev_greeting_id and prev_greeting_id != current_msg_id:
+        safe_delete_message(chat_id, prev_greeting_id)
+
+    # Редактируем текущее сообщение (rules -> greeting) с учётом типа reply_markup
+    try:
+        if isinstance(reply_markup, InlineKeyboardMarkup):
+            bot.edit_message_text(chat_id=chat_id, message_id=current_msg_id, text=greeting, reply_markup=reply_markup)
+            set_last_bot_message_safe(user_id, "greeting", current_msg_id)
+        else:
+            # редактируем текст без reply_markup
+            bot.edit_message_text(chat_id=chat_id, message_id=current_msg_id, text=greeting)
+            if reply_markup:
+                # отправляем новое сообщение с reply-клавиатурой и удаляем текущее
+                sent = bot.send_message(chat_id, greeting, reply_markup=reply_markup)
+                safe_delete_message(chat_id, current_msg_id)
+                set_last_bot_message_safe(user_id, "greeting", sent.message_id)
+            else:
+                set_last_bot_message_safe(user_id, "greeting", current_msg_id)
+    except Exception:
+        logger.exception("Failed to edit rules->greeting; sending new greeting", extra={"user_id": user_id})
+        try:
+            safe_delete_message(chat_id, current_msg_id)
+        except Exception:
+            pass
+        try:
+            sent = bot.send_message(chat_id, greeting, reply_markup=reply_markup if not isinstance(reply_markup, InlineKeyboardMarkup) else reply_markup)
+            set_last_bot_message_safe(user_id, "greeting", sent.message_id)
+        except Exception:
+            logger.exception("Failed to send fallback greeting in back_to_start", extra={"user_id": user_id})
+
+    # Обновляем resources
+    if role == "client":
+        if prev_resources_id and prev_resources_id != current_msg_id:
+            try:
+                bot.edit_message_text(chat_id=chat_id, message_id=prev_resources_id, text="Посетите наши ресурсы:", reply_markup=inline_markup)
+                set_last_bot_message_safe(user_id, "resources", prev_resources_id)
+            except Exception:
+                try:
+                    sent_res = bot.send_message(chat_id, "Посетите наши ресурсы:", reply_markup=inline_markup)
+                    set_last_bot_message_safe(user_id, "resources", sent_res.message_id)
+                    if prev_resources_id and prev_resources_id != sent_res.message_id:
+                        safe_delete_message(chat_id, prev_resources_id)
+                except Exception:
+                    logger.exception("Failed to send resources in back_to_start", extra={"user_id": user_id})
+        else:
+            try:
+                sent_res = bot.send_message(chat_id, "Посетите наши ресурсы:", reply_markup=inline_markup)
+                set_last_bot_message_safe(user_id, "resources", sent_res.message_id)
+            except Exception:
+                logger.exception("Failed to send resources (no prev) in back_to_start", extra={"user_id": user_id})
+    else:
+        if prev_resources_id:
+            safe_delete_message(chat_id, prev_resources_id)
+        set_last_bot_message_safe(user_id, "resources", None)
 
 
-# Хэндлер регистрации
-@bot.message_handler(func=lambda message: message.text == "Регистрация")
-def handle_registration(message):
-    chat_id = message.chat.id
+# Регистрация: полный блок
 
-    # Проверяем, находится ли пользователь в черном списке
-    if is_user_blacklisted(chat_id):
-        bot.send_message(chat_id, "К сожалению, вы не можете зарегистрироваться, так как находитесь в черном списке.")
-        return
+# Утилиты и клавиатуры
+def normalize_phone(raw_phone: str) -> str | None:
+    """
+    Нормализует телефон в формат 8XXXXXXXXXX.
+    Возвращает строку или None, если номер некорректен.
+    """
+    if not raw_phone:
+        return None
+    digits = re.sub(r"\D", "", raw_phone)
+    if len(digits) == 11 and digits.startswith("8"):
+        return digits
+    if len(digits) == 11 and digits.startswith("7"):
+        return "8" + digits[1:]
+    if len(digits) == 10:
+        return "8" + digits
+    return None
+def make_confirm_phone_kb():
+    """
+    Inline-клавиатура для подтверждения привязки номера.
+    """
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("✅ Привязать номер", callback_data="confirm_phone_yes"))
+    kb.add(types.InlineKeyboardButton("❌ Ввести другой номер", callback_data="confirm_phone_no"))
+    return kb
+def make_progress_text(step: int, total: int, title: str) -> str:
+    """
+    Возвращает аккуратную строку прогресса регистрации.
+    """
+    return f"🔹 <b>Шаг {step}/{total}</b>\n{title}"
 
-    # Проверяем, зарегистрирован ли уже пользователь
-    if Clients.get_row_by_user_id(chat_id):
-        bot.send_message(chat_id, "Вы уже зарегистрированы!")
-        handle_start(message)
-        return
 
-    # Сохраняем состояние для шага регистрации имени
-    set_user_state(chat_id, Registration.REGISTERING_NAME)
-    bot.send_message(chat_id, "Введите ваше имя:")
+# История сообщений регистрации (для постепенной очистки)
+def add_reg_message(chat_id, msg):
+    """
+    Сохраняет ID сообщения бота, связанного с процессом регистрации, в temp_user_data[chat_id]['reg_history'].
+    msg может быть объектом Message или целым message_id.
+    """
+    try:
+        temp_user_data.setdefault(chat_id, {})
+        hist = temp_user_data[chat_id].setdefault("reg_history", [])
+        msg_id = getattr(msg, "message_id", None) or (msg if isinstance(msg, int) else None)
+        if msg_id and msg_id not in hist:
+            hist.append(int(msg_id))
+    except Exception:
+        try:
+            logger.exception("add_reg_message failed", extra={"user_id": chat_id})
+        except Exception:
+            pass
+def add_reg_user_input(chat_id, msg):
+    """
+    Сохраняет ID сообщения пользователя, отправленного в процессе регистрации,
+    чтобы потом можно было удалить его (чтобы чат не захламлялся).
+    """
+    try:
+        temp_user_data.setdefault(chat_id, {})
+        inputs = temp_user_data[chat_id].setdefault("reg_user_inputs", [])
+        msg_id = getattr(msg, "message_id", None) or (msg if isinstance(msg, int) else None)
+        if msg_id and msg_id not in inputs:
+            inputs.append(int(msg_id))
+    except Exception:
+        try:
+            logger.exception("add_reg_user_input failed", extra={"user_id": chat_id})
+        except Exception:
+            pass
+def cleanup_reg_history(chat_id, initial_delay: float = 1.0, step: float = 1.0, reverse: bool = False):
+    """
+    Постепенно удаляет все сообщения, связанные с регистрацией, которые сохранены в
+    temp_user_data[chat_id]['reg_history'] и temp_user_data[chat_id]['reg_user_inputs'].
+    """
+    try:
+        data = temp_user_data.get(chat_id, {})
+        history = list(data.get("reg_history", []))
+        user_inputs = list(data.get("reg_user_inputs", []))
 
+        combined = []
+        combined.extend(history)
+        combined.extend(user_inputs)
+
+        if not combined:
+            return
+
+        if reverse:
+            combined = list(reversed(combined))
+
+        for idx, mid in enumerate(combined):
+            delay = initial_delay + idx * step
+            try:
+                if "schedule_delete" in globals():
+                    schedule_delete(chat_id, mid, delay_seconds=delay)
+                else:
+                    threading.Timer(delay, lambda c=chat_id, m=mid: safe_delete_message(c, m)).start()
+            except Exception:
+                try:
+                    logger.exception("Failed to schedule deletion for reg message", extra={"user_id": chat_id, "message_id": mid})
+                except Exception:
+                    pass
+
+        temp_user_data.setdefault(chat_id, {})["reg_history"] = []
+        temp_user_data.setdefault(chat_id, {})["reg_user_inputs"] = []
+    except Exception:
+        try:
+            logger.exception("cleanup_reg_history failed", extra={"user_id": chat_id})
+        except Exception:
+            pass
+def cleanup_reg_history_immediately(chat_id):
+    """
+    Немедленно пытается удалить все сообщения регистрации (синхронно).
+    """
+    try:
+        data = temp_user_data.get(chat_id, {})
+        history = list(data.get("reg_history", []))
+        user_inputs = list(data.get("reg_user_inputs", []))
+        combined = history + user_inputs
+        for mid in combined:
+            try:
+                safe_delete_message(chat_id, mid)
+            except Exception:
+                try:
+                    logger.debug("Immediate delete failed for reg message", extra={"user_id": chat_id, "message_id": mid})
+                except Exception:
+                    pass
+        temp_user_data.setdefault(chat_id, {})["reg_history"] = []
+        temp_user_data.setdefault(chat_id, {})["reg_user_inputs"] = []
+    except Exception:
+        try:
+            logger.exception("cleanup_reg_history_immediately failed", extra={"user_id": chat_id})
+        except Exception:
+            pass
+def schedule_cleanup_after_summary(chat_id, summary_msg_id, delay_seconds: float = 5.0):
+    """
+    Планирует удаление итогового (summary) сообщения через delay_seconds и затем
+    запускает постепенную очистку остальной истории.
+    """
+    try:
+        if "schedule_delete" in globals():
+            schedule_delete(chat_id, summary_msg_id, delay_seconds=delay_seconds)
+        else:
+            threading.Timer(delay_seconds, lambda: safe_delete_message(chat_id, summary_msg_id)).start()
+
+        def _del_rest():
+            cleanup_reg_history(chat_id, initial_delay=0.5, step=0.7, reverse=False)
+
+        threading.Timer(delay_seconds + 0.5, _del_rest).start()
+    except Exception:
+        try:
+            logger.exception("schedule_cleanup_after_summary failed", extra={"user_id": chat_id})
+        except Exception:
+            pass
+
+# Помощники по корзине и владельцу номера
 def resolve_user_id(user_id):
     """
-    Возвращает user_id владельца корзины, если номер телефона зарегистрирован на другого пользователя.
-    Если связь не найдена, возвращается текущий user_id.
+    Возвращает user_id владельца корзины по телефону; если не найден — возвращает исходный user_id.
     """
     try:
-        # Получаем текущего пользователя
         current_user = Clients.get_row_by_user_id(user_id)
-        if not current_user or not current_user.phone:
-            # Если пользователя нет или у него нет телефона, используем его же user_id
+        if not current_user or not getattr(current_user, "phone", None):
             return user_id
-
-        # Ищем владельца телефона
         owner = Clients.get_row_by_phone(current_user.phone)
         if not owner:
-            # Если владельца телефона нет, возвращаем текущий user_id
             return user_id
-
-        # Если телефон уже привязан к другому пользователю, возвращаем его user_id
         return owner.user_id
-    except Exception as e:
-        print(f"[ERROR]: Ошибка при определении владельца корзины для пользователя {user_id}: {e}")
+    except Exception:
+        logger.exception("resolve_user_id failed", extra={"user_id": user_id})
         return user_id
-
 def add_to_cart(user_id, post_id, quantity):
     """
     Добавление товара в корзину владельца телефона.
     """
     try:
-        # Определяем владельца корзины
         actual_user_id = resolve_user_id(user_id)
-
-        # Добавляем товар в корзину владельца телефона
-        Reservations.insert(
-            user_id=actual_user_id,
-            post_id=post_id,
-            quantity=quantity
-        )
-
-        print(f"✔️ Товар добавлен в корзину пользователя {actual_user_id} (первоначальный ID {user_id}).")
-    except Exception as e:
-        print(f"[ERROR]: Ошибка при добавлении товара в корзину: {e}")
-
+        Reservations.insert(user_id=actual_user_id, post_id=post_id, quantity=quantity)
+        logger.info("Added to cart", extra={"owner_id": actual_user_id, "original_user": user_id, "post_id": post_id, "quantity": quantity})
+    except Exception:
+        logger.exception("add_to_cart failed", extra={"user_id": user_id, "post_id": post_id})
 def get_user_cart(user_id):
     """
     Возвращает содержимое корзины для всех пользователей, связанных с одним номером телефона.
-    Если телефон или владелец не найден, возвращает пустой список.
     """
     try:
-        # Получаем текущего пользователя
         current_user = Clients.get_row_by_user_id(user_id)
-        if not current_user or not current_user.phone:
-            return []  # Если пользователя нет или отсутствует привязанный номер, возвращаем пустую корзину
-
-        # Получаем всех пользователей, связанных с этим номером
+        if not current_user or not getattr(current_user, "phone", None):
+            return []
         with Session(bind=engine) as session:
-            user_ids = session.query(Clients.user_id).filter(Clients.phone == current_user.phone).all()
-
-        # Преобразуем список user_id для запроса заказов
-        user_ids = [uid[0] for uid in user_ids]
-
-        # Получаем заказы для всех связанных пользователей
+            rows = session.query(Clients.user_id).filter(Clients.phone == current_user.phone).all()
+        user_ids = [uid[0] for uid in rows]
         orders = []
         for uid in user_ids:
-            user_orders = Reservations.get_row_by_user_id(uid)
+            user_orders = Reservations.get_row_by_user_id(uid) or []
             orders.extend(user_orders)
-
         return orders
-    except Exception as e:
-        print(f"[ERROR]: Ошибка при получении объединённой корзины: {e}")
+    except Exception:
+        logger.exception("get_user_cart failed", extra={"user_id": user_id})
         return []
-
 def clear_cart(user_id):
     """
-    Очистка корзины для пользователя.
+    Очистка корзины для владельца телефона.
     """
     try:
-        # Определяем владельца корзины
         actual_user_id = resolve_user_id(user_id)
-
-        # Очищаем корзину для владельца
         Reservations.delete_row(user_id=actual_user_id)
-        print(f"✔️ Корзина очищена для пользователя {actual_user_id} (для {user_id}).")
-    except Exception as e:
-        print(f"[ERROR]: Ошибка при очистке корзины: {e}")
+        logger.info("Cart cleared", extra={"owner_id": actual_user_id, "original_user": user_id})
+    except Exception:
+        logger.exception("clear_cart failed", extra={"user_id": user_id})
 
-# Имя для регистрации
+
+# Хэндлеры регистрации
+@bot.message_handler(func=lambda message: message.text == "Регистрация")
+def handle_registration(message):
+    chat_id = message.chat.id
+    try:
+        if is_user_blacklisted(chat_id):
+            bot.send_message(chat_id, "⛔ К сожалению, вы не можете зарегистрироваться — вы в чёрном списке.")
+            return
+
+        if Clients.get_row_by_user_id(chat_id):
+            # Временное уведомление, которое удалится через несколько секунд
+            try:
+                info_msg = bot.send_message(chat_id, "ℹ️ Вы уже зарегистрированы.")
+                add_reg_message(chat_id, info_msg)
+                try:
+                    if "schedule_delete" in globals():
+                        schedule_delete(chat_id, info_msg.message_id, delay_seconds=3.0)
+                    else:
+                        threading.Timer(3.0, lambda: safe_delete_message(chat_id, info_msg.message_id)).start()
+                except Exception:
+                    pass
+            except Exception:
+                logger.debug("Failed to send 'already registered' notice", extra={"user_id": chat_id})
+            handle_start(message)
+            return
+
+        # Подготовка временных данных регистрации
+        temp_user_data.setdefault(chat_id, {})
+        temp_user_data[chat_id].pop("name", None)
+        temp_user_data[chat_id].pop("phone", None)
+        temp_user_data[chat_id].pop("reg_history", None)
+        temp_user_data[chat_id].pop("reg_user_inputs", None)
+
+        set_user_state(chat_id, Registration.REGISTERING_NAME)
+
+        # Отправляем единое сообщение прогресса и сохраняем его id
+        sent = bot.send_message(chat_id, "🔹 Шаг 1/2\nВведите ваше имя:", parse_mode="HTML")
+        temp_user_data[chat_id]["reg_msg_id"] = sent.message_id
+        add_reg_message(chat_id, sent)
+
+        # Сохраняем и сразу удаляем сообщение пользователя "Регистрация", чтобы не оставлять следа
+        try:
+            add_reg_user_input(chat_id, message)
+            # Используем safe_delete_message, чтобы не пробрасывать исключения
+            safe_delete_message(chat_id, message.message_id)
+        except Exception:
+            # Если удаление не удалось — логируем и продолжаем
+            logger.debug("Failed to delete user's 'Регистрация' message", extra={"user_id": chat_id, "message_id": getattr(message, "message_id", None)})
+
+    except Exception:
+        logger.exception("handle_registration failed", extra={"user_id": chat_id})
+        bot.send_message(chat_id, "❌ Произошла ошибка при начале регистрации. Попробуйте позже.")
+
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == Registration.REGISTERING_NAME)
 def handle_name_registration(message):
     chat_id = message.chat.id
-    user_name = message.text.strip()
+    user_name = (message.text or "").strip()
+    try:
+        add_reg_user_input(chat_id, message)
+        if len(user_name) < 2:
+            err = bot.send_message(chat_id, "⚠️ Имя слишком короткое. Введите хотя бы 2 символа.")
+            add_reg_message(chat_id, err)
+            try:
+                if "schedule_delete" in globals():
+                    schedule_delete(chat_id, err.message_id, delay_seconds=4.0)
+                else:
+                    threading.Timer(4.0, lambda: safe_delete_message(chat_id, err.message_id)).start()
+            except Exception:
+                pass
+            return
 
-    # Проверяем валидность имени
-    if len(user_name) < 2:
-        bot.send_message(chat_id, "Имя слишком короткое. Пожалуйста, введите хотя бы 2 символа.")
-        return
+        temp_user_data.setdefault(chat_id, {})["name"] = user_name
 
-    # Сохраняем имя во временные данные
-    if chat_id not in temp_user_data:
-        temp_user_data[chat_id] = {}
-    temp_user_data[chat_id]["name"] = user_name
+        try:
+            bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+        except Exception:
+            pass
 
-    # Переход к следующему шагу - вводу номера
-    set_user_state(chat_id, Registration.STARTED_REGISTRATION)
-    bot.send_message(chat_id, "Введите ваш номер телефона:")
+        set_user_state(chat_id, Registration.STARTED_REGISTRATION)
+        reg_msg_id = temp_user_data[chat_id].get("reg_msg_id")
+        step2_text = f"🔹 Шаг 2/2\nВаше имя: <b>{user_name}</b>\n\nВведите ваш номер телефона (например, +7XXXXXXXXXX или 8XXXXXXXXXX):"
+        try:
+            if reg_msg_id:
+                bot.edit_message_text(chat_id=chat_id, message_id=reg_msg_id, text=step2_text, parse_mode="HTML")
+            else:
+                sent = bot.send_message(chat_id, step2_text, parse_mode="HTML")
+                temp_user_data[chat_id]["reg_msg_id"] = sent.message_id
+                add_reg_message(chat_id, sent)
+        except Exception:
+            logger.exception("Failed to edit reg progress to step2", extra={"user_id": chat_id})
+            sent = bot.send_message(chat_id, step2_text, parse_mode="HTML")
+            temp_user_data[chat_id]["reg_msg_id"] = sent.message_id
+            add_reg_message(chat_id, sent)
+    except Exception:
+        logger.exception("handle_name_registration failed", extra={"user_id": chat_id})
+        bot.send_message(chat_id, "❌ Ошибка при вводе имени. Попробуйте снова.")
 
-# Номер для регистрации
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == Registration.STARTED_REGISTRATION)
 def handle_phone_registration(message):
     chat_id = message.chat.id
-    raw_phone = message.text.strip()
-    cleaned_phone = re.sub(r"\D", "", raw_phone)
+    raw_phone = (message.text or "").strip()
+    try:
+        add_reg_user_input(chat_id, message)
+        cleaned_phone = normalize_phone(raw_phone)
+        if not cleaned_phone:
+            err_text = "❌ Неверный формат номера. Введите номер в формате +7XXXXXXXXXX или 8XXXXXXXXXX."
+            try:
+                err_msg = bot.send_message(chat_id, err_text)
+                add_reg_message(chat_id, err_msg)
+                try:
+                    if "schedule_delete" in globals():
+                        schedule_delete(chat_id, err_msg.message_id, delay_seconds=5.0)
+                    else:
+                        threading.Timer(5.0, lambda: safe_delete_message(chat_id, err_msg.message_id)).start()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            return
 
-    # Проверка валидности номер через регулярное выражение
-    if is_phone_valid(cleaned_phone):
-        if cleaned_phone.startswith("7"):
-            cleaned_phone = "8" + cleaned_phone[1:]
+        temp_user_data.setdefault(chat_id, {})["phone"] = cleaned_phone
 
-        # Проверяем наличие номера в базе
-        existing_client = Clients.get_row_by_phone(cleaned_phone)
-        if existing_client:
-            # Номер уже существует
-            bot.send_message(
-                chat_id,
-                f"⚠️ Номер телефона {cleaned_phone} уже зарегистрирован. Вы уверены, что хотите его привязать к своему аккаунту? "
-                "Эта операция уведомит текущего владельца номера.",
-                reply_markup=create_yes_no_keyboard()  # Генерируем клавиатуру
-            )
-            # Сохраняем телефон во временные данные для подтверждения
-            if chat_id not in temp_user_data:
-                temp_user_data[chat_id] = {}
-            temp_user_data[chat_id]["phone"] = cleaned_phone
-            set_user_state(chat_id, Registration.REGISTERING_PHONE)  # Переходим в состояние подтверждения номера
-        else:
-            # Если номер уникальный, завершаем регистрацию
+        try:
+            bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+        except Exception:
+            pass
+
+        reg_msg_id = temp_user_data[chat_id].get("reg_msg_id")
+        name = temp_user_data[chat_id].get("name", "Неизвестный")
+        step_confirm_text = f"🔹 Шаг 2/2\nВаше имя: <b>{name}</b>\nВаш номер: <b>{cleaned_phone}</b>\n\nСохраняем эти данные?"
+        try:
+            kb = make_confirm_phone_kb()
+            if reg_msg_id:
+                bot.edit_message_text(chat_id=chat_id, message_id=reg_msg_id, text=step_confirm_text, parse_mode="HTML", reply_markup=kb)
+            else:
+                sent = bot.send_message(chat_id, step_confirm_text, parse_mode="HTML", reply_markup=kb)
+                temp_user_data[chat_id]["reg_msg_id"] = sent.message_id
+                add_reg_message(chat_id, sent)
+            set_user_state(chat_id, Registration.REGISTERING_PHONE)
+        except Exception:
+            logger.exception("Failed to show phone confirmation", extra={"user_id": chat_id})
             complete_registration(chat_id, cleaned_phone)
-    else:
-        bot.send_message(chat_id, "❌ Введите корректный номер телефона. Например, +7XXXXXXXXXX")
+    except Exception:
+        logger.exception("handle_phone_registration failed", extra={"user_id": chat_id})
+        bot.send_message(chat_id, "❌ Ошибка при обработке номера. Попробуйте позже.")
 
-# Валидация номера телефона
-def is_phone_valid(phone):
-    pattern = r"^(8|7|\+7)\d{10}$"
-    return re.match(pattern, phone) is not None
-
-# Подтверждение номера
-@bot.message_handler(func=lambda message: get_user_state(message.chat.id) == Registration.REGISTERING_PHONE)
-def confirm_phone_registration(message):
-    chat_id = message.chat.id
-    response = message.text.strip().lower()
-
-    # Проверка временных данных (подстраховка)
-    if chat_id not in temp_user_data or "phone" not in temp_user_data[chat_id]:
-        bot.send_message(chat_id, "❌ Ошибка: временные данные регистрации потеряны. Попробуйте снова.")
-        clear_user_state(chat_id)
-        return
-
-    # Получаем телефон и имя из временных данных
-    phone = temp_user_data[chat_id]["phone"]
-    name = temp_user_data[chat_id].get("name", "Неизвестный")
-
-    if response == "да":
-        # Проверяем, существует ли уже пользователь с таким номером телефона
-        existing_client = Clients.get_row_by_phone(phone)
-        if existing_client:
-            # Если телефон уже существует, все равно добавляем нового пользователя с этим телефоном.
-            # Корзина объединяется через `resolve_user_id` автоматически.
-
-            # Добавляем нового пользователя
-            Clients.insert(
-                user_id=chat_id,
-                name=name,
-                phone=phone,  # Используем тот же номер телефона
-                role="client"  # Роль по умолчанию
-            )
-
-            # Сообщаем текущему владельцу
-            bot.send_message(
-                existing_client.user_id,
-                f"⚠️ Новый пользователь ({name}) зарегистрировался с номером телефона {phone}. "
-                "Все заказы для этого телефона будут сохраняться в вашей корзине."
-            )
-
-            # Оповещаем нового пользователя
-            bot.send_message(
-                chat_id,
-                f"✅ Вы успешно зарегистрированы! Корзина будет привязана к номеру {phone}, "
-                "используемому несколькими пользователями.",
-                reply_markup=types.ReplyKeyboardRemove()
-            )
-
-            # Завершаем регистрацию (важно!)
+# Callback‑хэндлеры подтверждения и завершение
+@bot.callback_query_handler(func=lambda call: call.data == "confirm_phone_yes")
+def callback_confirm_phone_yes(call):
+    chat_id = call.from_user.id
+    try:
+        data = temp_user_data.get(chat_id, {})
+        phone = data.get("phone")
+        name = data.get("name", "Неизвестный")
+        if not phone:
+            bot.answer_callback_query(call.id, "Данные регистрации потеряны. Введите номер заново.", show_alert=True)
             clear_user_state(chat_id)
-            handle_start(message)
-        else:
-            # Если номер уникальный, завершаем обычную регистрацию
-            complete_registration(chat_id, phone)
-    elif response == "нет":
-        # Если пользователь отказался, предлагаем ввести новый номер телефона
-        bot.send_message(chat_id, "❌ Регистрация номера отменена. Введите новый номер телефона:")
-        set_user_state(chat_id, Registration.STARTED_REGISTRATION)
-    else:
-        # Если пользователь ввел что-то не то
-        bot.send_message(
-            chat_id,
-            "⚠️ Пожалуйста, введите *'Да'* для подтверждения или *'Нет'* для отказа.",
-            parse_mode="Markdown"
-        )
+            return
 
+        existing_client = Clients.get_row_by_phone(phone)
+
+        # Если user_id совпадает с ADMIN_USER_ID из config, даём роль supreme_leader
+        role_to_set = "client"
+        try:
+            if chat_id == ADMIN_USER_ID:
+                role_to_set = "supreme_leader"
+        except Exception:
+            # Если config или ADMIN_USER_ID недоступны — оставляем client
+            pass
+
+        Clients.insert(user_id=chat_id, name=name, phone=phone, role=role_to_set)
+
+        try:
+            if existing_client and getattr(existing_client, "user_id", None):
+                bot.send_message(existing_client.user_id, "⚠️ К вашему номеру привязан новый аккаунт. Если это не вы, обратитесь в поддержку.")
+        except Exception:
+            logger.warning("Failed to notify phone owner", extra={"phone": phone})
+
+        summary_text = f"✅ Регистрация завершена\n\nВаше имя: <b>{name}</b>\nВаш номер телефона: <b>{phone}</b>"
+        sent = None
+        try:
+            sent = bot.send_message(chat_id, summary_text, parse_mode="HTML")
+            add_reg_message(chat_id, sent)
+        except Exception:
+            logger.exception("Failed to send registration summary", extra={"user_id": chat_id})
+
+        # Сразу удаляем все промежуточные сообщения регистрации
+        try:
+            reg_msg_id = temp_user_data.get(chat_id, {}).get("reg_msg_id")
+            if reg_msg_id:
+                try:
+                    safe_delete_message(chat_id, reg_msg_id)
+                except Exception:
+                    pass
+            try:
+                cleanup_reg_history_immediately(chat_id)
+            except Exception:
+                try:
+                    cleanup_reg_history(chat_id, initial_delay=0.1, step=0.1, reverse=True)
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception("Failed to immediate-clean registration messages", extra={"user_id": chat_id})
+
+        # Планируем удаление итогового сообщения через 5 секунд
+        if sent:
+            try:
+                if "schedule_delete" in globals():
+                    schedule_delete(chat_id, sent.message_id, delay_seconds=5.0)
+                else:
+                    threading.Timer(5.0, lambda: safe_delete_message(chat_id, sent.message_id)).start()
+            except Exception:
+                logger.exception("Failed to schedule deletion of summary message", extra={"user_id": chat_id, "message_id": getattr(sent, "message_id", None)})
+
+        # Убираем reply-клавиатуру: отправляем невидимый символ с ReplyKeyboardRemove и сразу удаляем это сообщение
+        try:
+            rm = bot.send_message(chat_id, "\u200b", reply_markup=types.ReplyKeyboardRemove())
+            try:
+                if "schedule_delete" in globals():
+                    schedule_delete(chat_id, rm.message_id, delay_seconds=0.5)
+                else:
+                    threading.Timer(0.5, lambda: safe_delete_message(chat_id, rm.message_id)).start()
+            except Exception:
+                pass
+        except Exception:
+            logger.debug("Failed to send/remove ReplyKeyboardRemove", extra={"user_id": chat_id})
+
+        clear_user_state(chat_id)
+        temp_user_data.pop(chat_id, None)
+
+        bot.answer_callback_query(call.id, "Номер привязан")
+        handle_start(SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=None))
+    except Exception:
+        logger.exception("callback_confirm_phone_yes failed", extra={"user_id": chat_id})
+        try:
+            bot.answer_callback_query(call.id, "Ошибка при подтверждении. Попробуйте снова.", show_alert=True)
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda call: call.data == "confirm_phone_no")
+def callback_confirm_phone_no(call):
+    chat_id = call.from_user.id
+    try:
+        set_user_state(chat_id, Registration.STARTED_REGISTRATION)
+        if chat_id in temp_user_data:
+            temp_user_data[chat_id].pop("phone", None)
+        bot.answer_callback_query(call.id, "Введите новый номер")
+        reg_msg_id = temp_user_data.get(chat_id, {}).get("reg_msg_id")
+        name = temp_user_data.get(chat_id, {}).get("name", "Неизвестный")
+        try:
+            text = f"🔹 Шаг 2/2\nВаше имя: <b>{name}</b>\n\nВведите новый номер телефона:"
+            if reg_msg_id:
+                bot.edit_message_text(chat_id=chat_id, message_id=reg_msg_id, text=text, parse_mode="HTML")
+            else:
+                sent = bot.send_message(chat_id, text, parse_mode="HTML")
+                add_reg_message(chat_id, sent)
+        except Exception:
+            bot.send_message(chat_id, "Введите новый номер телефона:", parse_mode="HTML")
+    except Exception:
+        logger.exception("callback_confirm_phone_no failed", extra={"user_id": chat_id})
+        try:
+            bot.answer_callback_query(call.id, "Ошибка. Попробуйте снова.", show_alert=True)
+        except Exception:
+            pass
+
+# Поиск первого владельца по телефону
 def get_first_owner_by_phone(phone):
     """
     Ищет первого владельца номера телефона по id (минимальному значению).
     Если номера телефона нет, возвращает None.
     """
     try:
-        # Ищем в таблице клиентов самого первого владельца номера по id
         with Session(bind=engine) as session:
             first_owner = (
                 session.query(Clients)
                 .filter(Clients.phone == phone)
-                .order_by(Clients.id.asc())  # Сортировка по id для определения первого владельца
+                .order_by(Clients.id.asc())
                 .first()
             )
             return first_owner
-    except Exception as e:
-        print(f"[ERROR]: Ошибка при поиске первого владельца номера телефона: {e}")
+    except Exception:
+        logger.exception("get_first_owner_by_phone failed", extra={"phone": phone})
         return None
 
-# Завершение регистрации
+# Завершение регистрации (фоллбек)
 def complete_registration(chat_id, phone):
     """
-    Завершает регистрацию. Если номер уже существует, все равно добавляет нового пользователя в базу.
+    Завершает регистрацию (фоллбек, если inline-кнопки недоступны).
     """
-    # Получаем имя из временных данных
-    name = temp_user_data.get(chat_id, {}).get("name", "Неизвестный")
-
     try:
-        # Устанавливаем роль (по умолчанию 'client')
-        role = "supreme_leader" if chat_id == ADMIN_USER_ID else "client"
+        name = temp_user_data.get(chat_id, {}).get("name", "Неизвестный")
+        # Если этот user_id совпадает с ADMIN_USER_ID из config — даём supreme_leader
+        role_to_set = "client"
+        try:
+            if chat_id == ADMIN_USER_ID:
+                role_to_set = "supreme_leader"
+        except Exception:
+            pass
 
-        # Проверяем существующего пользователя с таким телефоном
         existing_client = Clients.get_row_by_phone(phone)
+        Clients.insert(user_id=chat_id, name=name, phone=phone, role=role_to_set)
 
-        if existing_client:
-            # Если номер телефона существует, добавляем нового пользователя с этим номером
-            Clients.insert(
-                user_id=chat_id,
-                name=name,
-                phone=phone,  # Используем уже существующий телефон
-                role=role  # Роль по умолчанию
-            )
+        try:
+            if existing_client and getattr(existing_client, "user_id", None):
+                bot.send_message(existing_client.user_id, "⚠️ Новый аккаунт привязан к вашему номеру. Если это не вы, обратитесь в поддержку.")
+        except Exception:
+            logger.warning("Failed to notify first owner in complete_registration", extra={"phone": phone})
 
-            # Уведомляем нового пользователя
-            bot.send_message(
-                chat_id,
-                f"✅ Вы успешно зарегистрированы. Ваш номер телефона {phone} уже используется, "
-                "и ваша корзина будет объединена с текущими бронированиями.",
-                reply_markup=types.ReplyKeyboardRemove()
-            )
+        summary_text = f"✅ Регистрация завершена\n\nВаше имя: <b>{name}</b>\nВаш номер телефона: <b>{phone}</b>"
+        sent = None
+        try:
+            sent = bot.send_message(chat_id, summary_text, parse_mode="HTML")
+            add_reg_message(chat_id, sent)
+        except Exception:
+            logger.exception("Failed to send registration summary", extra={"user_id": chat_id})
 
-            # Уведомляем первого владельца телефона (если важно)
-            bot.send_message(
-                existing_client.user_id,
-                f"⚠️ Новый пользователь ({name}) зарегистрировался под вашим номером телефона ({phone}). "
-                "Бронирования будут объединены."
-            )
+        # Немедленно удаляем прогресс/вводы
+        try:
+            reg_msg_id = temp_user_data.get(chat_id, {}).get("reg_msg_id")
+            if reg_msg_id:
+                try:
+                    safe_delete_message(chat_id, reg_msg_id)
+                except Exception:
+                    pass
+            try:
+                cleanup_reg_history_immediately(chat_id)
+            except Exception:
+                try:
+                    cleanup_reg_history(chat_id, initial_delay=0.1, step=0.1, reverse=True)
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception("Failed to immediate-clean registration messages in complete_registration", extra={"user_id": chat_id})
 
-        else:
-            # Если номер уникальный, продолжаем обычную регистрацию
-            Clients.insert(
-                user_id=chat_id,
-                name=name,
-                phone=phone,
-                role=role  # Роль по умолчанию
-            )
+        # Планируем удаление итогового сообщения через 5 секунд
+        if sent:
+            try:
+                if "schedule_delete" in globals():
+                    schedule_delete(chat_id, sent.message_id, delay_seconds=5.0)
+                else:
+                    threading.Timer(5.0, lambda: safe_delete_message(chat_id, sent.message_id)).start()
+            except Exception:
+                logger.exception("Failed to schedule deletion of summary message", extra={"user_id": chat_id, "message_id": getattr(sent, "message_id", None)})
 
-            bot.send_message(
-                chat_id,
-                f"✅ Регистрация завершена! Ваш номер телефона {phone} сохранен.",
-                reply_markup=types.ReplyKeyboardRemove()
-            )
-
-        # Завершаем процесс регистрации
         clear_user_state(chat_id)
+        temp_user_data.pop(chat_id, None)
         handle_start(SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=None))
+    except Exception:
+        logger.exception("complete_registration failed", extra={"user_id": chat_id, "phone": phone})
+        try:
+            bot.send_message(chat_id, "❌ Во время регистрации произошла ошибка. Попробуйте позже.")
+        except Exception:
+            pass
 
-    except Exception as e:
-        bot.send_message(chat_id, "❌ Во время регистрации произошла ошибка. Попробуйте позже.")
-        print(f"[ERROR]: Ошибка завершения регистрации: {e}")
 
 # Создание клавиатуры да или нет для подтверждения номера
 def create_yes_no_keyboard():
@@ -557,133 +1049,187 @@ def is_user_registered(phone: str) -> bool:
         print(f"Ошибка проверки пользователя: {e}")
         return False
 
+
+# -----------------------
+# Локальная блокировка по post_id (предотвращает гонки в одном процессе)
+# -----------------------
+_post_locks: dict[int, threading.Lock] = globals().get("_post_locks", {})
+
+def _get_post_lock(post_id: int) -> threading.Lock:
+    lock = _post_locks.get(post_id)
+    if lock is None:
+        lock = threading.Lock()
+        _post_locks[post_id] = lock
+    return lock
+
+# -----------------------
 # Обработчик запроса бронирования
+# -----------------------
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reserve_"))
 def handle_reservation(call):
-    post_id = int(call.data.split("_", 1)[1])
-    user_id = call.from_user.id
-    if is_user_blacklisted(user_id):
-        return "Вы не можете бронировать товары, так как вы были заблокированы"
-    if not is_registered(user_id):
-        bot.answer_callback_query(
-            callback_query_id=call.id,
-            text="Вы не зарегистрированы! Для регистрации перейдите в бота",
-            show_alert=True,
-        )
-        return
-    with Session(bind=engine) as session:
+    try:
+        post_id = int(call.data.split("_", 1)[1])
+    except Exception:
         try:
-            # Получаем текущий товар с блокировкой строки
-            post = session.query(Posts).filter(Posts.id == post_id).with_for_update().first()
-            if not post or post.quantity <= 0:
-                # Проверка очереди
-                user_in_queue = session.query(TempReservations).filter(
-                    and_(
-                        TempReservations.user_id == user_id,
-                        TempReservations.post_id == post_id,
-                        TempReservations.temp_fulfilled == False
-                    )
-                ).first()
-                if user_in_queue:
-                    bot.answer_callback_query(
-                        callback_query_id=call.id,
-                        text="Вы уже стоите в очереди за этим товаром!",
-                        show_alert=True,
-                    )
+            bot.answer_callback_query(call.id, "Некорректный идентификатор товара.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    user_id = call.from_user.id
+
+    # Мгновенный отклик, чтобы пользователь видел, что запрос принят
+    try:
+        bot.answer_callback_query(call.id, "Обрабатываем ваш запрос...", show_alert=False)
+    except Exception:
+        pass
+
+    if is_user_blacklisted(user_id):
+        try:
+            bot.send_message(user_id, "⛔ Вы не можете бронировать товары — вы в чёрном списке.")
+        except Exception:
+            logger.debug("Failed to notify blacklisted user", extra={"user_id": user_id})
+        return
+
+    if not is_registered(user_id):
+        try:
+            bot.answer_callback_query(call.id, "Вы не зарегистрированы! Для регистрации перейдите в бота", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    lock = _get_post_lock(post_id)
+    with lock:
+        with Session(bind=engine) as session:
+            try:
+                # Получаем текущий товар с блокировкой строки
+                post = session.query(Posts).filter(Posts.id == post_id).with_for_update().first()
+                if not post:
+                    try:
+                        bot.send_message(user_id, "Товар не найден.")
+                    except Exception:
+                        pass
                     return
-                # Добавляем в очередь
-                temp_reservation = TempReservations(
+
+                # Если нет в наличии — добавляем в очередь (если ещё не в ней)
+                if getattr(post, "quantity", 0) <= 0:
+                    user_in_queue = session.query(TempReservations).filter(
+                        and_(
+                            TempReservations.user_id == user_id,
+                            TempReservations.post_id == post_id,
+                            TempReservations.temp_fulfilled == False
+                        )
+                    ).first()
+                    if user_in_queue:
+                        try:
+                            bot.answer_callback_query(call.id, "Вы уже стоите в очереди за этим товаром!", show_alert=True)
+                        except Exception:
+                            pass
+                        return
+
+                    temp_reservation = TempReservations(
+                        user_id=user_id,
+                        post_id=post_id,
+                        quantity=1,
+                        temp_fulfilled=False
+                    )
+                    session.add(temp_reservation)
+                    session.commit()
+                    try:
+                        bot.answer_callback_query(call.id, "Вы добавлены в очередь на этот товар.", show_alert=True)
+                    except Exception:
+                        pass
+                    return
+
+                # Есть в наличии — уменьшаем количество и создаём резерв в одной транзакции
+                post.quantity = post.quantity - 1
+                reservation = Reservations(
                     user_id=user_id,
                     post_id=post_id,
                     quantity=1,
-                    temp_fulfilled=False
+                    is_fulfilled=False,
+                    old_price=getattr(post, "price", None)
                 )
-                session.add(temp_reservation)
-                session.commit()
-                bot.answer_callback_query(
-                    callback_query_id=call.id,
-                    text="Вы добавлены в очередь на этот товар.",
-                    show_alert=True,
-                )
-                return
-            # Если товар доступен, уменьшаем его количество
-            post.quantity -= 1
-            session.commit()
-            # Сохраняем бронирование
-            reservation = Reservations(
-                user_id=user_id,
-                post_id=post_id,
-                quantity=1,
-                is_fulfilled=False,
-                old_price=post.price
-            )
-            session.add(reservation)
-            session.commit()
-            # Обновляем сообщение в канале
-            new_caption = (
-                f"Цена: {post.price} ₽\nОписание: {post.description}\nОстаток: {post.quantity}"
-            )
-            try:
-                bot.edit_message_caption(
-                    chat_id=CHANNEL_ID,
-                    message_id=post.message_id,
-                    caption=new_caption,
-                    reply_markup=call.message.reply_markup,
-                )
-            except Exception as e:
-                bot.send_message(
-                    user_id, f"Не удалось обновить сообщение в канале. Ошибка: {e}"
-                )
+                session.add(reservation)
+                session.commit()  # один commit после всех изменений
 
-            # Отправляем личное сообщение с фото товара, описанием и кнопкой отмены
-            cancel_button = InlineKeyboardMarkup()
-            cancel_button.add(
-                InlineKeyboardButton(
-                    text="🚫 Это я не заказывал",
-                    callback_data=f"cancel_reservation_{reservation.id}"
+                # Обновляем сообщение в канале (если есть message_id)
+                if getattr(post, "message_id", None):
+                    new_caption = f"Цена: {post.price} ₽\nОписание: {post.description}\nОстаток: {post.quantity}"
+                    try:
+                        bot.edit_message_caption(
+                            chat_id=CHANNEL_ID,
+                            message_id=post.message_id,
+                            caption=new_caption,
+                            reply_markup=call.message.reply_markup,
+                        )
+                    except Exception:
+                        logger.debug("Failed to edit channel caption", extra={"post_id": post_id})
 
+                # Отправляем личное сообщение с фото товара, описанием и кнопкой отмены
+                cancel_button = InlineKeyboardMarkup()
+                cancel_button.add(
+                    InlineKeyboardButton(
+                        text="🚫 Это я не заказывал",
+                        callback_data=f"cancel_reservation_{reservation.id}"
+                    )
                 )
-            )
-            try:
-                bot.send_photo(
-                    chat_id=user_id,
-                    photo=post.photo,  # Ссылка на фото товара
-                    caption=(
-                        f"Вы забронировали товар!\n\n"
-                        f"🏷️ Название: {post.description}\n"
-                        f"💲 Цена: {post.price} ₽\n"
-                        f"Если это была ошибка, нажмите кнопку ниже."
-                    ),
-                    reply_markup=cancel_button,
-                )
-            except Exception as e:
-                bot.send_message(
-                    chat_id=user_id,
-                    text=f"Не удалось отправить информацию о бронировании. Ошибка: {e}",
-                )
+                try:
+                    if getattr(post, "photo", None):
+                        bot.send_photo(
+                            chat_id=user_id,
+                            photo=post.photo,
+                            caption=(
+                                f"✅ Вы забронировали товар!\n\n"
+                                f"🏷️ Название: {post.description}\n"
+                                f"💲 Цена: {post.price} ₽\n\n"
+                                f"Если это была ошибка, нажмите кнопку ниже."
+                            ),
+                            reply_markup=cancel_button,
+                        )
+                    else:
+                        bot.send_message(
+                            chat_id=user_id,
+                            text=(
+                                f"✅ Вы забронировали товар: {post.description}\n"
+                                f"💲 Цена: {post.price} ₽\n\n"
+                                f"Если это была ошибка, нажмите кнопку ниже."
+                            ),
+                            reply_markup=cancel_button,
+                        )
+                except Exception:
+                    logger.debug("Failed to send reservation details to user", extra={"user_id": user_id, "post_id": post_id})
+                    try:
+                        bot.send_message(user_id, "✅ Товар забронирован. Проверьте раздел 'Мои заказы'.")
+                    except Exception:
+                        pass
 
-            # Уведомление пользователя
-            if post.quantity == 0:
-                bot.answer_callback_query(
-                    callback_query_id=call.id,
-                    text="Вы забронировали последний экземпляр товара!",
-                    show_alert=True,
-                )
-            else:
-                bot.answer_callback_query(
-                    callback_query_id=call.id,
-                    text="Вы забронировали товар!",
-                    show_alert=True,
-                )
-        except IntegrityError:
-            session.rollback()
-            bot.answer_callback_query(
-                callback_query_id=call.id,
-                text="Произошла ошибка при бронировании. Попробуйте снова.",
-                show_alert=True,
-            )
+                # Уведомление пользователя через callback (короткое)
+                try:
+                    if post.quantity == 0:
+                        bot.answer_callback_query(call.id, "Вы забронировали последний экземпляр товара!", show_alert=True)
+                    else:
+                        bot.answer_callback_query(call.id, "Вы забронировали товар!", show_alert=True)
+                except Exception:
+                    pass
 
-# Получение бронирования пользователя
+            except IntegrityError:
+                session.rollback()
+                try:
+                    bot.answer_callback_query(call.id, "Произошла ошибка при бронировании. Попробуйте снова.", show_alert=True)
+                except Exception:
+                    pass
+            except Exception:
+                session.rollback()
+                logger.exception("Unexpected error in handle_reservation", extra={"user_id": user_id, "post_id": post_id})
+                try:
+                    bot.answer_callback_query(call.id, "Произошла ошибка при обработке бронирования. Попробуйте позже.", show_alert=True)
+                except Exception:
+                    pass
+
+# -----------------------
+# Получение бронирований пользователя
+# -----------------------
 def get_user_reservations(user_id):
     """
     Получение всех заказов текущего пользователя, а также всех пользователей с таким же номером телефона.
@@ -691,16 +1237,21 @@ def get_user_reservations(user_id):
     # Получаем текущие данные пользователя
     client = Clients.get_row_by_user_id(user_id)
     if client is None:
-        print("Пользователь не найден.")
+        logger.debug("get_user_reservations: client not found", extra={"user_id": user_id})
         return []  # Пользователь не зарегистрирован
 
-    # Находим всех пользователей с таким же номером телефона
-    related_clients = Clients.get_row_by_phone_digits(phone_digits=client.phone[-4:])
+    # Находим всех пользователей с таким же номером телефона (предпочтительно точный поиск)
+    if hasattr(Clients, "get_rows_by_phone"):
+        related_clients = Clients.get_rows_by_phone(client.phone)
+    elif hasattr(Clients, "get_row_by_phone_digits"):
+        related_clients = Clients.get_row_by_phone_digits(phone_digits=client.phone[-4:])
+    else:
+        related_clients = [client]
+
     if not related_clients:
-        print("Связанные пользователи по последним цифрам не найдены.")
+        logger.debug("get_user_reservations: no related clients", extra={"user_id": user_id})
         return []
 
-    # Debug: какие пользователи найдены
     related_user_ids = [related_client.user_id for related_client in related_clients]
 
     # Собираем все бронирования для этих пользователей
@@ -711,31 +1262,46 @@ def get_user_reservations(user_id):
 
     return reservations
 
-# Обработчик моих забронированных товаров
+# -----------------------
+# Обработчик моих забронированных товаров (команда)
+# -----------------------
 @bot.message_handler(commands=["my_reservations"])
 def show_reservations(message):
     user_id = message.chat.id
     query = Clients.get_row(user_id=user_id)
     # Проверка регистрации пользователя
-    # if not is_registered(user_id):
     if query is None:
-        msg = bot.send_message(
-            user_id,
-            "Вы не зарегистрированы! Для регистрации используйте команду /start register.",
-        )
-        user_messages[user_id] = [msg.message_id]
+        try:
+            msg = bot.send_message(
+                user_id,
+                "Вы не зарегистрированы! Для регистрации используйте команду /start register.",
+            )
+            user_messages[user_id] = [msg.message_id]
+        except Exception:
+            pass
         return
 
     # Получаем заказы пользователя
     reservations = get_user_reservations(user_id)
 
     if reservations:
-        for idx, (description, price, photo, quantity, is_fulfilled) in enumerate(
-            reservations, start=1
-        ):
-            status = "✅ Положено" if is_fulfilled else "⏳ Ожидает выполнения"
+        for idx, order in enumerate(reservations, start=1):
+            # Поддерживаем оба варианта: ORM-объект Reservations или кортежи
+            try:
+                if hasattr(order, "post_id"):
+                    post = Posts.get_row_by_id(order.post_id)
+                    description = getattr(post, "description", "Описание отсутствует")
+                    price = getattr(post, "price", 0)
+                    photo = getattr(post, "photo", None)
+                    quantity = getattr(order, "quantity", 1)
+                    is_fulfilled = getattr(order, "is_fulfilled", False)
+                else:
+                    description, price, photo, quantity, is_fulfilled = order
+            except Exception:
+                logger.debug("Skipping malformed reservation entry", extra={"user_id": user_id})
+                continue
 
-            # Формируем описание
+            status = "✅ Положено" if is_fulfilled else "⏳ Ожидает выполнения"
             caption = (
                 f"{idx}. Описание: {description}\n"
                 f"💰 Цена: {price}₽ x {quantity}\n"
@@ -747,14 +1313,40 @@ def show_reservations(message):
                     sent_photo = bot.send_photo(user_id, photo=photo, caption=caption)
                     user_messages.setdefault(user_id, []).append(sent_photo.message_id)
                 except Exception as e:
-                    bot.send_message(
-                        user_id, f"Ошибка при показе фотографии: {e}"
-                    )  # Показываем ошибку
+                    logger.debug("Failed to send reservation photo", extra={"user_id": user_id, "error": str(e)})
+                    try:
+                        bot.send_message(user_id, caption)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    sent = bot.send_message(user_id, caption)
+                    user_messages.setdefault(user_id, []).append(sent.message_id)
+                except Exception:
+                    pass
+    else:
+        try:
+            keyboard = InlineKeyboardMarkup(row_width=1)
+            keyboard.add(InlineKeyboardButton(text="На канал", url=channel_link))
+            sent_message = bot.send_message(
+                chat_id=user_id,
+                text="У вас пока нет заказов. Начните покупки, перейдя на наш канал.",
+                reply_markup=keyboard,
+            )
+            user_last_message_id[user_id] = sent_message.message_id
+        except Exception:
+            pass
 
-# Хэндлер для обработки нажатий на заказ
+# -----------------------
+# Хэндлер для обработки нажатий на заказ (детали)
+# -----------------------
 @bot.callback_query_handler(func=lambda call: call.data.startswith("order_"))
 def order_details(call):
-    reservation_id = int(call.data.split("_")[1])
+    try:
+        reservation_id = int(call.data.split("_", 1)[1])
+    except Exception:
+        bot.answer_callback_query(call.id, "Некорректный идентификатор заказа.", show_alert=True)
+        return
 
     try:
         # Получаем информацию о заказе через ORM
@@ -781,24 +1373,43 @@ def order_details(call):
             markup.add(cancel_btn)
 
         # Обновляем сообщение с деталями заказа
-        bot.edit_message_media(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            media=InputMediaPhoto(media=post.photo, caption=caption),
-            reply_markup=markup
-        )
+        try:
+            bot.edit_message_media(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                media=InputMediaPhoto(media=post.photo, caption=caption),
+                reply_markup=markup
+            )
+        except Exception:
+            # Если редактирование не удалось — отправляем текстовое сообщение
+            try:
+                bot.send_message(chat_id=call.message.chat.id, text=caption, reply_markup=markup)
+            except Exception:
+                pass
     except Exception as e:
-        print(f"Ошибка отображения деталей заказа: {e}")
+        logger.exception("Ошибка отображения деталей заказа", extra={"user_id": call.from_user.id, "error": str(e)})
         bot.answer_callback_query(call.id, "Произошла ошибка.", show_alert=True)
 
-# Отображает список заказов
+# -----------------------
+# Отображает список заказов (callback)
+# -----------------------
 @bot.callback_query_handler(func=lambda call: call.data == "my_orders")
 def show_my_orders(call):
     message = call.message
-    my_orders(message)  # Вызываем my_orders, передаём исходное сообщение
-    bot.answer_callback_query(call.id)  # Подтверждаем обработку нажатия
+    # Вызываем вашу существующую функцию my_orders (она есть ниже в этом же блоке)
+    try:
+        my_orders(message)
+    except Exception:
+        logger.exception("show_my_orders failed", extra={"user_id": call.from_user.id})
+    finally:
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception:
+            pass
 
-# Обработчик функции Мои заказы
+# -----------------------
+# Обработчик функции Мои заказы (ВАША ОРИГИНАЛЬНАЯ ФУНКЦИЯ — НЕ МЕНЯЛ)
+# -----------------------
 @bot.message_handler(func=lambda message: message.text == "🛒 Мои заказы")
 def my_orders(message):
     user_id = message.chat.id
@@ -842,37 +1453,42 @@ def my_orders(message):
             )
             user_last_message_id[user_id] = sent_message.message_id  # Сохраняем ID последнего сообщения
     except Exception as ex:
-        print(f"Ошибка в обработке команды '🛒 Мои заказы': {ex}")
+        logger.exception("Ошибка в обработке команды '🛒 Мои заказы'", extra={"user_id": user_id, "error": str(ex)})
 
-
+# -----------------------
 # Создает страницу с заказами
+# -----------------------
 def send_order_page(user_id, message_id, orders, page):
     orders_per_page = 5  # Количество заказов на одной странице
     start = page * orders_per_page
     end = start + orders_per_page
-    total_pages = (len(orders) - 1) // orders_per_page + 1
+    total_pages = (len(orders) - 1) // orders_per_page + 1 if orders else 1
     selected_orders = orders[start:end]
 
     # Считаем общую сумму всех заказов
-    total_sum_all = sum(
-        Posts.get_row_by_id(order.post_id).price for order in orders if Posts.get_row_by_id(order.post_id)
-    )
+    total_sum_all = 0
+    total_sum_fulfilled = 0
+    posts_cache = {}
 
-    # Считаем сумму только выполненных заказов
-    total_sum_fulfilled = sum(
-        Posts.get_row_by_id(order.post_id).price
-        for order in orders
-        if order.is_fulfilled and Posts.get_row_by_id(order.post_id)
-    )
+    for order in orders:
+        try:
+            post = Posts.get_row_by_id(order.post_id)
+            if post:
+                posts_cache[post.id] = post
+                total_sum_all += getattr(post, "price", 0) or 0
+                if getattr(order, "is_fulfilled", False):
+                    total_sum_fulfilled += getattr(post, "price", 0) or 0
+        except Exception:
+            continue
 
     # Формирование текста для страницы. Колонки: описание, цена, статус заказа.
     text = f"Ваши заказы (стр. {page + 1} из {total_pages}):\n\n"
     keyboard = InlineKeyboardMarkup(row_width=1)
 
     for order in selected_orders:
-        post = Posts.get_row_by_id(order.post_id)  # Проверка и получение данных поста через ORM
+        post = posts_cache.get(getattr(order, "post_id", None)) or (Posts.get_row_by_id(order.post_id) if hasattr(order, "post_id") else None)
         if post:
-            status = "✅В корзине" if order.is_fulfilled else "⏳В обработке"
+            status = "✅В корзине" if getattr(order, "is_fulfilled", False) else "⏳В обработке"
             keyboard.add(InlineKeyboardButton(
                 text=f"({status})- {post.price} ₽ - {post.description}",
                 callback_data=f"order_{order.id}"
@@ -890,28 +1506,47 @@ def send_order_page(user_id, message_id, orders, page):
 
     # Фото для страницы
     photo_path = "images/my_cart.jpg"
-    with open(photo_path, "rb") as photo:
-        if message_id:
-            return bot.edit_message_media(
-                chat_id=user_id,
-                message_id=message_id,
-                media=InputMediaPhoto(photo, caption=text),
-                reply_markup=keyboard
-            )
-        else:
-            return bot.send_photo(
-                chat_id=user_id,
-                photo=photo,
-                caption=text,
-                reply_markup=keyboard
-            )
+    try:
+        with open(photo_path, "rb") as photo:
+            if message_id:
+                return bot.edit_message_media(
+                    chat_id=user_id,
+                    message_id=message_id,
+                    media=InputMediaPhoto(photo, caption=text),
+                    reply_markup=keyboard
+                )
+            else:
+                return bot.send_photo(
+                    chat_id=user_id,
+                    photo=photo,
+                    caption=text,
+                    reply_markup=keyboard
+                )
+    except Exception:
+        try:
+            if message_id:
+                bot.edit_message_text(chat_id=user_id, message_id=message_id, text=text, reply_markup=keyboard)
+                return SimpleNamespace(message_id=message_id)
+            else:
+                return bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+        except Exception:
+            return None
 
+# -----------------------
 # Обработчик навигации между страницами
+# -----------------------
 @bot.callback_query_handler(func=lambda call: call.data.startswith("orders_page_"))
 def paginate_orders(call):
-    user_id = call.message.chat.id
-    message_id = call.message.message_id
-    page = int(call.data.split("_")[2])
+    try:
+        user_id = call.message.chat.id
+        message_id = call.message.message_id
+        page = int(call.data.split("_")[2])
+    except Exception:
+        try:
+            bot.answer_callback_query(call.id, "Некорректная страница.", show_alert=True)
+        except Exception:
+            pass
+        return
 
     # Получаем заказы пользователя и связанных клиентов
     orders = get_user_reservations(user_id)
@@ -919,16 +1554,22 @@ def paginate_orders(call):
     # Отправляем страницу с заказами
     try:
         new_message = send_order_page(user_id=user_id, message_id=message_id, orders=orders, page=page)
-        user_last_message_id[user_id] = new_message.message_id  # Обновляем последний ID
+        if new_message and getattr(new_message, "message_id", None):
+            user_last_message_id[user_id] = new_message.message_id  # Обновляем последний ID
     except Exception as e:
-        print(f"Ошибка при попытке пагинации заказов: {e}")
+        logger.exception("Ошибка при попытке пагинации заказов", extra={"user_id": user_id, "error": str(e)})
     finally:
-        bot.answer_callback_query(call.id)  # Подтверждаем успешную обработку
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception:
+            pass
 
+# -----------------------
 # Обработка отмены заказа
+# -----------------------
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_"))
 def cancel_reservation(call):
-    print(f"Чета там чета там: {call.data}")  # Логируем callback_data для отладки
+    logger.debug("cancel_reservation called", extra={"data": call.data, "user_id": call.from_user.id})
     try:
         # Универсальная обработка двух форматов данных
         if call.data.startswith("cancel_reservation_"):
@@ -955,7 +1596,7 @@ def cancel_reservation(call):
             bot.answer_callback_query(call.id, "Вы не зарегистрированы.", show_alert=True)
             return
 
-        related_clients = Clients.get_row_by_phone_digits(phone_digits=current_user.phone[-4:])
+        related_clients = Clients.get_row_by_phone_digits(phone_digits=current_user.phone[-4:]) if hasattr(Clients, "get_row_by_phone_digits") else [current_user]
         related_user_ids = [client.user_id for client in related_clients]
 
         order = Reservations.get_row_by_id(reservation_id)
@@ -993,13 +1634,19 @@ def cancel_reservation(call):
                 next_in_queue.temp_fulfilled = True
                 session.commit()
 
-                bot.send_message(
-                    chat_id=next_in_queue.user_id,
-                    text="Ваш товар в очереди стал доступен и добавлен в вашу корзину."
-                )
+                try:
+                    bot.send_message(
+                        chat_id=next_in_queue.user_id,
+                        text="Ваш товар в очереди стал доступен и добавлен в вашу корзину."
+                    )
+                except Exception:
+                    pass
 
-                bot.answer_callback_query(call.id, "Вы успешно отказались от товара. Он передан следующему в очереди.",
-                                          show_alert=False)
+                try:
+                    bot.answer_callback_query(call.id, "Вы успешно отказались от товара. Он передан следующему в очереди.", show_alert=False)
+                except Exception:
+                    pass
+
                 my_orders(call.message)
                 return
 
@@ -1024,24 +1671,44 @@ def cancel_reservation(call):
                     caption=updated_caption,
                     reply_markup=markup,
                 )
-            except Exception as e:
-                print(f"Ошибка обновления поста на канале: {e}")
+            except Exception:
+                logger.debug("Ошибка обновления поста на канале после отмены", extra={"post_id": post.id})
 
-        bot.answer_callback_query(call.id, "Вы успешно отказались от товара. Товар доступен в канале.",
-                                  show_alert=False)
+        try:
+            bot.answer_callback_query(call.id, "Вы успешно отказались от товара. Товар доступен в канале.", show_alert=False)
+        except Exception:
+            pass
+
         my_orders(call.message)
 
     except ValueError as ve:
-        print(f"Некорректные callback-данные: {ve}")
-        bot.answer_callback_query(call.id, "Некорректные данные для отмены.", show_alert=True)
-    except Exception as e:
-        print(f"Ошибка при попытке отказаться от заказа: {e}")
-        bot.answer_callback_query(call.id, "Произошла ошибка при обработке отмены.", show_alert=True)
+        logger.debug("Некорректные callback-данные для cancel", extra={"data": call.data})
+        try:
+            bot.answer_callback_query(call.id, "Некорректные данные для отмены.", show_alert=True)
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("Ошибка при попытке отказаться от заказа", extra={"user_id": call.from_user.id, "data": call.data})
+        try:
+            bot.answer_callback_query(call.id, "Произошла ошибка при обработке отмены.", show_alert=True)
+        except Exception:
+            pass
 
+# -----------------------
+# Enqueue handler
+# -----------------------
 @bot.callback_query_handler(func=lambda call: call.data.startswith("enqueue_"))
 def handle_enqueue(call):
-    user_id = call.message.chat.id
-    post_id = int(call.data.split("_")[1])
+    try:
+        post_id = int(call.data.split("_", 1)[1])
+    except Exception:
+        try:
+            bot.answer_callback_query(call.id, "Некорректный идентификатор.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    user_id = call.from_user.id
 
     # Проверяем, существует ли запись уже в TempReservations
     with Session(bind=engine) as session:
@@ -1052,32 +1719,46 @@ def handle_enqueue(call):
         ).first()
 
         if existing_entry:
+            try:
+                bot.answer_callback_query(call.id, "Вы уже в очереди.", show_alert=True)
+            except Exception:
+                pass
             return
 
-    # Добавляем в таблицу TempReservations
-    TempReservations.insert(user_id=user_id, quantity=1, post_id=post_id, temp_fulfilled=False)
-    bot.send_message(user_id, "Вы добавлены в очередь. Как только товар станет доступен, вы будете уведомлены.")
+        temp = TempReservations(user_id=user_id, quantity=1, post_id=post_id, temp_fulfilled=False)
+        session.add(temp)
+        session.commit()
 
+    try:
+        bot.answer_callback_query(call.id, "Вы добавлены в очередь. Уведомим, когда товар станет доступен.", show_alert=False)
+    except Exception:
+        pass
+
+# -----------------------
 # Возврат в меню заказов
+# -----------------------
 @bot.callback_query_handler(func=lambda call: call.data == "go_back")
 def go_back_to_menu(call):
-    # Если объект — сообщение (Message), то работаем с ним напрямую
-    if isinstance(call, telebot.types.Message):
-        chat_id = call.chat.id
-    # Если объект — CallbackQuery, извлекаем его компонент message
-    elif isinstance(call, telebot.types.CallbackQuery):
-        chat_id = call.message.chat.id
-        # Сразу подтверждаем callback_query
-        try:
-            bot.answer_callback_query(call.id)
-        except Exception as e:
-            print(f"Failed to answer callback query: {e}")
-    else:
-        print("Unsupported object type passed to go_back_to_menu")
-        return
+    try:
+        # Если объект — CallbackQuery, извлекаем его компонент message
+        if isinstance(call, telebot.types.CallbackQuery) and call.message:
+            chat_id = call.message.chat.id
+            try:
+                bot.answer_callback_query(call.id)
+            except Exception:
+                pass
+        elif isinstance(call, telebot.types.Message):
+            chat_id = call.chat.id
+        else:
+            return
 
-    # Отправляем сообщение пользователю
-    bot.send_message(chat_id, "Вы вернулись в главное меню.")
+        try:
+            bot.send_message(chat_id, "Вы вернулись в главное меню.")
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("go_back_to_menu failed", extra={})
+
 
 # Обработчик функции 🚗 Заказы в доставке
 @bot.message_handler(func=lambda message: message.text == "🚗 Заказы в доставке")
@@ -1140,51 +1821,111 @@ def show_delivery_orders(message):
             text=f"❌ Ошибка при загрузке списка заказов: {str(e)}",
         )
 
-# Создает страницу с заказами в доставке
+def _shorten(text: str, length: int = 48) -> str:
+    if not text:
+        return ""
+    return text if len(text) <= length else text[: length - 1].rstrip() + "…"
+
+def _format_price(amount) -> str:
+    try:
+        amt = int(amount)
+        return f"{amt:,}".replace(",", "\u202F") + " ₽"
+    except Exception:
+        return f"{amount} ₽"
+
 def send_delivery_order_page(user_id, message_id, orders, page):
-    orders_per_page = 5  # Количество товаров на странице
+    orders_per_page = 5
     start = page * orders_per_page
     end = start + orders_per_page
-    total_pages = (len(orders) - 1) // orders_per_page + 1  # Всего страниц
-    selected_orders = orders[start:end]  # Текущая страница товаров
+    total = len(orders)
+    total_pages = (total - 1) // orders_per_page + 1 if total else 1
+    selected = orders[start:end]
 
-    # Формируем сообщение для текущей страницы
-    text = f"🚚 *Ваши товары в доставке* (страница {page + 1} из {total_pages}):\n\n"
+    # Считаем общую сумму и общее количество
+    total_items = sum(o.get("quantity", 0) for o in orders)
+    total_sum = sum(o.get("total_sum", 0) for o in orders)
+
+    # Заголовок и сводка (HTML)
+    header = f"<b>🚚 Ваши товары в доставке</b> — <i>страница {page + 1} из {total_pages}</i>\n"
+    summary = (
+        f"<b>Позиций:</b> <b>{total_items}</b>  •  "
+        f"<b>Итого:</b> <b>{_format_price(total_sum)}</b>\n\n"
+    )
+
+    # Формируем компактные карточки и клавиатуру
     keyboard = InlineKeyboardMarkup(row_width=1)
+    lines = []
+    for idx, order in enumerate(selected, start=start + 1):
+        desc = _shorten(order.get("item_description", "Товар"))
+        qty = order.get("quantity", 0)
+        sum_text = _format_price(order.get("total_sum", 0))
+        status_emoji = "📦"  # можно менять по статусу
+        line = f"{idx}. {status_emoji} <b>{desc}</b>\n<i>Кол-во:</i> {qty} • <b>{sum_text}</b>"
+        lines.append(line)
 
-    # Добавляем товары на страницу
-    for idx, order in enumerate(selected_orders, start=start + 1):
-        text += (
-            f"*{idx})* {order['item_description']}\n"
-            f"Количество: {order['quantity']}\n"
-            f"Сумма: {order['total_sum']} руб.\n"
-            f"➖➖➖➖➖➖➖➖➖➖\n"
-        )
+        # Кнопка открыть детали (callback order_delivery_{index})
+        # Используем уникальный callback: delivery_item_{start_index + offset}
+        callback_id = f"delivery_item_{start + (idx - start) }"
+        keyboard.add(InlineKeyboardButton(text=f"🔎 {desc} — {sum_text}", callback_data=callback_id))
 
-    # Добавляем кнопки для навигации
+    # Навигация
+    nav_buttons = []
     if page > 0:
-        keyboard.add(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"delivery_page_{page - 1}"))
-    if end < len(orders):
-        keyboard.add(InlineKeyboardButton(text="➡️ Вперёд", callback_data=f"delivery_page_{page + 1}"))
+        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"delivery_page_{page - 1}"))
+    nav_buttons.append(InlineKeyboardButton(f"Стр. {page + 1}/{total_pages}", callback_data="noop_delivery"))
+    if end < total:
+        nav_buttons.append(InlineKeyboardButton("➡️ Вперёд", callback_data=f"delivery_page_{page + 1}"))
+    keyboard.row(*nav_buttons)
+    keyboard.add(InlineKeyboardButton("На канал", url=channel_link))
 
-    # Гифка для уведомления
+    caption = header + summary
+    if lines:
+        caption += "\n\n".join(lines)
+    else:
+        caption += "У вас пока нет товаров на этой странице."
+
+    # Баннер / гиф сверху: используем ваш gif, но отправляем как фото/гиф с подписью
     gif_path = "images/delivery_order.gif"
-    with open(gif_path, "rb") as gif:
-        if message_id:  # Если сообщение уже существует, обновляем его
-            bot.edit_message_media(
-                chat_id=user_id,
-                message_id=message_id,
-                media=InputMediaAnimation(gif, caption=text, parse_mode="Markdown"),
-                reply_markup=keyboard,
-            )
-        else:  # Иначе отправляем новое сообщение
-            bot.send_animation(
-                chat_id=user_id,
-                animation=gif,
-                caption=text,
-                reply_markup=keyboard,
-                parse_mode="Markdown",
-            )
+    try:
+        with open(gif_path, "rb") as gif:
+            if message_id:
+                # Попытка обновить существующее сообщение с медиа
+                try:
+                    return bot.edit_message_media(
+                        chat_id=user_id,
+                        message_id=message_id,
+                        media=InputMediaAnimation(gif, caption=caption, parse_mode="HTML"),
+                        reply_markup=keyboard,
+                    )
+                except Exception:
+                    # fallback: редактируем текст
+                    try:
+                        return bot.edit_message_text(chat_id=user_id, message_id=message_id, text=caption, parse_mode="HTML", reply_markup=keyboard)
+                    except Exception:
+                        return None
+            else:
+                # Отправляем новое сообщение с гифкой и подписью
+                try:
+                    return bot.send_animation(chat_id=user_id, animation=gif, caption=caption, parse_mode="HTML", reply_markup=keyboard)
+                except Exception:
+                    # fallback: отправляем текст
+                    return bot.send_message(chat_id=user_id, text=caption, parse_mode="HTML", reply_markup=keyboard)
+    except FileNotFoundError:
+        # Если гиф отсутствует — отправляем текст с клавиатурой
+        if message_id:
+            try:
+                bot.edit_message_text(chat_id=user_id, message_id=message_id, text=caption, parse_mode="HTML", reply_markup=keyboard)
+                return SimpleNamespace(message_id=message_id)
+            except Exception:
+                return None
+        else:
+            return bot.send_message(chat_id=user_id, text=caption, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        # В крайнем случае — отправляем текст
+        try:
+            return bot.send_message(chat_id=user_id, text=caption, parse_mode="HTML", reply_markup=keyboard)
+        except Exception:
+            return None
 
 # Хэндлер для команды "👔 Назначить работника"
 @bot.message_handler(func=lambda message: message.text == "👔 Назначить работника")
@@ -2449,90 +3190,193 @@ def register_name(message):
     set_user_state(user_id, Registration.REGISTERING_PHONE)
 
 # Статистика
+logger = logging.getLogger(__name__)
+
+def _text_similarity(a: str, b: str) -> float:
+    """Возвращает коэффициент похожести двух строк (0..1)."""
+    if not a or not b:
+        return 0.0
+    try:
+        return SequenceMatcher(None, a, b).ratio()
+    except Exception:
+        return 0.0
+
+def _is_revision_by_heuristic(post, earlier_posts, text_threshold: float = 0.75) -> bool:
+    """
+    Эвристика определения ревизионного поста без дополнительных полей в БД.
+    Правила (любое из них даёт True):
+      - точное совпадение photo (если есть) и price
+      - точное совпадение description (строго) с другим автором
+      - текстовая похожесть description >= text_threshold с другим автором
+      - совпадение price + умеренная похожесть текста (>= 0.65)
+    earlier_posts — список постов, созданных раньше post.created_at.
+    """
+    try:
+        desc = (getattr(post, "description", "") or "").strip()
+        photo = getattr(post, "photo", None)
+        price = getattr(post, "price", None)
+        post_author = getattr(post, "chat_id", None)
+    except Exception:
+        return False
+
+    for ep in earlier_posts:
+        try:
+            # сравниваем только с постами других авторов
+            if getattr(ep, "chat_id", None) == post_author:
+                continue
+
+            ep_desc = (getattr(ep, "description", "") or "").strip()
+            ep_photo = getattr(ep, "photo", None)
+            ep_price = getattr(ep, "price", None)
+
+            # 1) точное совпадение фото (если есть) и цена
+            if photo and ep_photo and photo == ep_photo:
+                if price is not None and ep_price == price:
+                    return True
+
+            # 2) точное совпадение описания
+            if desc and ep_desc and desc == ep_desc:
+                return True
+
+            # 3) текстовая похожесть
+            sim = _text_similarity(desc, ep_desc)
+            if sim >= text_threshold:
+                return True
+
+            # 4) совпадение цены + умеренная похожесть текста
+            if price is not None and ep_price == price and sim >= 0.65:
+                return True
+
+        except Exception:
+            # пропускаем проблемную пару
+            continue
+
+    return False
+
 @bot.message_handler(commands=['statistic'])
 def handle_statistic(message):
-    from datetime import datetime, timedelta
-
-    today = datetime.now()
-    monday = today - timedelta(days=today.weekday())
+    """
+    Полная функция статистики постов с учётом ревизий по эвристике.
+    Работает с вашей моделью Posts (поля: chat_id, photo, price, description, created_at).
+    """
+    now = datetime.now()
+    monday = now - timedelta(days=now.weekday())
     last_monday = monday - timedelta(days=7)
     last_sunday = monday - timedelta(days=1)
 
     days_range = {
-        'today': (today.date(), today.date()),
-        'week': (monday.date(), today.date()),
+        'today': (now.date(), now.date()),
+        'week': (monday.date(), now.date()),
         'last_week': (last_monday.date(), last_sunday.date())
     }
 
-    statistics = {"today": {}, "week": {}, "last_week": {}}
+    # statistics[period][author_name] = {"total": n, "revision": m}
+    statistics = {k: {} for k in days_range.keys()}
     total_posts = {"week": 0, "last_week": 0}
+    total_revision_posts = {"week": 0, "last_week": 0}
 
-    # Получение данных из базы данных
-    all_posts = Posts.get_row_all()  # Получаем все посты
-    all_clients = Clients.get_row_all()  # Получаем всех клиентов
+    # Получаем данные
+    try:
+        all_posts = Posts.get_row_all() or []
+    except Exception:
+        logger.exception("Failed to fetch posts for statistics")
+        all_posts = []
 
-    # Преобразование клиентов в словарь {user_id: name}
+    try:
+        all_clients = Clients.get_row_all() or []
+    except Exception:
+        logger.exception("Failed to fetch clients for statistics")
+        all_clients = []
+
+    # --- Надёжная сборка словаря клиентов: user_id -> name ---
     clients_dict = {}
-    if not all_clients:
+    try:
+        for c in all_clients:
+            try:
+                uid = getattr(c, "user_id", None)
+                name = getattr(c, "name", None) or "Неизвестный пользователь"
+                if uid is not None:
+                    clients_dict[uid] = name
+            except Exception:
+                continue
+    except Exception:
+        logger.exception("Failed to build clients_dict from Clients.get_row_all()")
         clients_dict = {}
-    elif isinstance(all_clients, dict):
-        clients_dict = {key: value.get("name", "Неизвестный пользователь") for key, value in all_clients.items()}
-    elif isinstance(all_clients, list):
-        if all(isinstance(client, dict) for client in all_clients):
-            clients_dict = {client["user_id"]: client.get("name", "Неизвестный пользователь") for client in all_clients}
-        else:
-            clients_dict = {client.user_id: client.name for client in all_clients}
-    else:
-        raise TypeError(f"Unsupported data type for 'all_clients': {type(all_clients)}")
+    # --------------------------------------------------------
 
-    # Генерация статистики постов
-    for key, date_range in days_range.items():
-        for post in all_posts:
-            created_at_date = post.created_at.date()
-            created_at_time = post.created_at.time()
+    # Сортируем посты по created_at (возрастающий порядок)
+    try:
+        sorted_posts = sorted([p for p in all_posts if hasattr(p, "created_at")], key=lambda x: x.created_at)
+    except Exception:
+        sorted_posts = list(all_posts)
 
-            # Исключаем посты с временем "00:00:00"
-            if created_at_time == datetime.min.time():
+    # Основной подсчёт
+    for period_key, date_range in days_range.items():
+        start_date, end_date = date_range
+        for idx, post in enumerate(sorted_posts):
+            try:
+                created_at = getattr(post, "created_at", None)
+                if not created_at:
+                    continue
+                created_date = created_at.date()
+                created_time = created_at.time()
+            except Exception:
                 continue
 
-            if date_range[0] <= created_at_date <= date_range[1]:
-                creator_name = clients_dict.get(post.chat_id, "Неизвестный пользователь")
-                if creator_name not in statistics[key]:
-                    statistics[key][creator_name] = 0
-                statistics[key][creator_name] += 1
+            # Исключаем записи с нулевым временем (как в вашем оригинале)
+            if created_time == datetime.min.time():
+                continue
 
-                # Считаем общее количество постов за неделю и прошлую неделю
-                if key == "week":
+            if start_date <= created_date <= end_date:
+                author_name = clients_dict.get(getattr(post, "chat_id", None), "Неизвестный пользователь")
+                if author_name not in statistics[period_key]:
+                    statistics[period_key][author_name] = {"total": 0, "revision": 0}
+
+                statistics[period_key][author_name]["total"] += 1
+
+                # earlier_posts — все посты с индексом < idx (созданы раньше)
+                earlier_posts = sorted_posts[:idx]
+                is_rev = _is_revision_by_heuristic(post, earlier_posts, text_threshold=0.75)
+
+                if is_rev:
+                    statistics[period_key][author_name]["revision"] += 1
+
+                # Счётчики для недель
+                if period_key == "week":
                     total_posts["week"] += 1
-                elif key == "last_week":
+                    if is_rev:
+                        total_revision_posts["week"] += 1
+                elif period_key == "last_week":
                     total_posts["last_week"] += 1
+                    if is_rev:
+                        total_revision_posts["last_week"] += 1
 
-    # Формирование текста ответа
-    response = "📊 Статистика постов:\n"
-    for period, names_data in statistics.items():
-        if period == "today":
-            period_label = "Сегодня"
-        elif period == "week":
-            period_label = "На этой неделе"
-        elif period == "last_week":
-            period_label = "На прошлой неделе"
-        else:
-            period_label = "Неизвестный период"
+    # Формируем текст ответа
+    lines = ["📊 Статистика постов:\n"]
+    labels = {"today": "Сегодня", "week": "На этой неделе", "last_week": "На прошлой неделе"}
+    for period_key in ("today", "week", "last_week"):
+        lines.append(f"\n{labels.get(period_key, period_key)}:\n")
+        data = statistics.get(period_key, {})
+        if not data:
+            lines.append("  — Нет данных\n")
+            continue
+        for name, counts in data.items():
+            total = counts.get("total", 0)
+            rev = counts.get("revision", 0)
+            if rev:
+                lines.append(f"  - {name}: {total} постов (из них {rev} через ревизию)\n")
+            else:
+                lines.append(f"  - {name}: {total} постов\n")
 
-        response += f"\n{period_label}:\n"
+    lines.append("\nОбщее количество постов:\n")
+    lines.append(f"  - На этой неделе: {total_posts['week']} постов (ревизий: {total_revision_posts['week']})\n")
+    lines.append(f"  - На прошлой неделе: {total_posts['last_week']} постов (ревизий: {total_revision_posts['last_week']})\n")
 
-        for name, count in names_data.items():
-            response += f"  - {name}: {count} постов\n"
-
-    # Добавляем общую статистику за неделю и прошлую неделю
-    response += f"\nОбщее количество постов:\n"
-    response += f"  - На этой неделе: {total_posts['week']} постов\n"
-    response += f"  - На прошлой неделе: {total_posts['last_week']} постов\n"
-
-    if not statistics["today"] and not statistics["week"] and not statistics["last_week"]:
-        response = "Нет статистики по постам за выбранные периоды."
-
-    bot.send_message(message.chat.id, response)
+    # Если нет данных вообще
+    if all(len(statistics[k]) == 0 for k in statistics):
+        bot.send_message(message.chat.id, "Нет статистики по постам за выбранные периоды.")
+    else:
+        bot.send_message(message.chat.id, "".join(lines))
 
 # Обработчик для кнопки 'Отправить рассылку'.
 @bot.message_handler(func=lambda message: message.text == "📤 Отправить рассылку")
