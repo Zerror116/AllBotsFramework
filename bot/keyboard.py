@@ -45,14 +45,16 @@ def audit_main_menu():
 
 def admin_main_menu():
     admin_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    create_new_post = KeyboardButton("➕ Новый пост")
     my_orders = KeyboardButton("🛒 Мои заказы")
     manage_posts = KeyboardButton("📄 Посты")
     send_new_posts_to_channel = KeyboardButton("📢 Отправить посты в канал")
     manage_clients = KeyboardButton("⚙️ Клиенты")
     send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
+    audit_manage = KeyboardButton(" Ревизия")
     manage_workres = KeyboardButton("👔 Назначить работника")
-    admin_keyboard.add( my_orders,manage_posts, send_new_posts_to_channel, manage_clients,
-                 send_all_reserved_to_group,manage_workres)
+    admin_keyboard.add( create_new_post,my_orders,manage_posts, send_new_posts_to_channel, manage_clients,
+                 send_all_reserved_to_group,audit_manage,manage_workres)
     return admin_keyboard
 def unknown_main_menu():
     unknown_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)

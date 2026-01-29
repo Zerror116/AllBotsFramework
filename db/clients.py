@@ -32,7 +32,7 @@ class Clients(AbstractModel):
         """
         Получить всех клиентов из базы данных.
         """
-        from db.db import Session, engine
+
         with Session(bind=engine) as session:
             query = session.query(Clients)
             return query.all()
@@ -59,7 +59,7 @@ class Clients(AbstractModel):
 
     @staticmethod
     def get_row_by_user_id(user_id):
-        from db.db import Session, engine
+
         with Session(bind=engine) as session:
             return session.query(Clients).filter(Clients.user_id == user_id).first()
 
