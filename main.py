@@ -1,14 +1,16 @@
 import io
+import os
 import re
 import time
 import telebot
 import locale
+from urllib.parse import quote
 
 from collections import defaultdict
 from openpyxl.workbook import Workbook
 from sqlalchemy import func
 from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu, supreme_leader_main_menu, audit_main_menu
-from telebot import types
+from telebot import types, apihelper
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputFile, InputMediaAnimation
 from database.config import *
 from db.for_delivery import ForDelivery
@@ -27,7 +29,58 @@ from sqlalchemy.exc import IntegrityError
 from datetime import datetime
 
 
+SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
+
+
+def build_telegram_proxy_url():
+    proxy_url = os.environ.get("TELEGRAM_PROXY_URL")
+    if proxy_url:
+        return proxy_url.strip()
+
+    host = os.environ.get("TELEGRAM_PROXY_HOST")
+    port = os.environ.get("TELEGRAM_PROXY_PORT")
+    if not host or not port:
+        return None
+
+    scheme = os.environ.get("TELEGRAM_PROXY_SCHEME", "socks5").strip().lower()
+    username = os.environ.get("TELEGRAM_PROXY_USERNAME")
+    password = os.environ.get("TELEGRAM_PROXY_PASSWORD")
+
+    auth = ""
+    if username:
+        auth = quote(username, safe="")
+        if password is not None:
+            auth = f"{auth}:{quote(password, safe='')}"
+        auth = f"{auth}@"
+
+    return f"{scheme}://{auth}{host}:{port}"
+
+
+def sanitize_proxy_url(proxy_url):
+    scheme, rest = proxy_url.split("://", 1)
+    if "@" in rest:
+        rest = rest.split("@", 1)[1]
+    return f"{scheme}://{rest}"
+
+
+def configure_telegram_proxy():
+    proxy_url = build_telegram_proxy_url()
+    if not proxy_url:
+        return
+
+    scheme = proxy_url.split("://", 1)[0].lower()
+    if scheme not in SUPPORTED_PROXY_SCHEMES:
+        raise ValueError(
+            f"Unsupported TELEGRAM_PROXY scheme '{scheme}'. "
+            "Use http, https, socks5 or socks5h."
+        )
+
+    apihelper.proxy = {"http": proxy_url, "https": proxy_url}
+    print(f"Telegram proxy enabled: {sanitize_proxy_url(proxy_url)}")
+
+
 # Настройка бота и кэш
+configure_telegram_proxy()
 bot = telebot.TeleBot(TOKEN)
 user_messages = {}
 user_pages = {}
@@ -4467,5 +4520,20 @@ def contact_client(call, user_id):
 
 
 # Запуск бота
+def run_bot():
+    retry_delay = 5
+
+    while True:
+        try:
+            bot.infinity_polling(timeout=30, long_polling_timeout=30)
+            retry_delay = 5
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print(f"Bot polling failed: {exc}. Retrying in {retry_delay} seconds.")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+
+
 if __name__ == "__main__":
-    bot.polling(none_stop=True)
+    run_bot()
