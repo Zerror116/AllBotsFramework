@@ -1,0 +1,15 @@
+# Исключение файла config.py из каталога database
+database/config.py
+
+# Общие исключения:
+__pycache__/           # Кэш Python
+*.py[cod]              # Компилированные Python-файлы
+*.sqlite3              # SQLite базы данных
+*.env                  # Файлы окружения
+*.log                  # Лог-файлы
+.DS_Store              # Системные файлы macOS
+.idea/                 # Конфигурация IDE (PyCharm)
+.vscode/               # Конфигурация VSCode
+*.bak                  # Резервные файлы
+*.tmp                  # Временные файлы
+*.swp                  # Резервные Vim файлы
